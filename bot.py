@@ -8,6 +8,8 @@ from aiogram.filters import CommandStart, Command
 from aiogram.client.default import DefaultBotProperties
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
+from aiohttp import web
+
 logging.basicConfig(level=logging.INFO)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -65,24 +67,19 @@ async def play_game(call: types.CallbackQuery):
 
     await call.answer()
 
-    # +1 к балансу
     bot_balance += 1
-
     dice_results = []
 
-    # отправляем 5 мячей (5 разных сообщений)
     for _ in range(5):
         msg = await bot.send_dice(
             chat_id=call.message.chat.id,
             emoji="🏀"
         )
         dice_results.append(msg.dice.value)
-        await asyncio.sleep(0.3)  # чуть разнесём анимации
+        await asyncio.sleep(0.3)
 
-    # ждём 5 секунд
     await asyncio.sleep(5)
 
-    # формируем результат
     result_lines = []
     hits = 0
 
@@ -93,7 +90,6 @@ async def play_game(call: types.CallbackQuery):
         else:
             result_lines.append(f"{i}. ❌ Промах")
 
-    # если все попали — минус 15
     if hits == 5:
         bot_balance -= 15
 
@@ -102,14 +98,12 @@ async def play_game(call: types.CallbackQuery):
         text="🎯 <b>Результаты бросков:</b>\n\n" + "\n".join(result_lines)
     )
 
-    # через 1 секунду — сообщение проигрыша
     await asyncio.sleep(1)
     await bot.send_message(
         chat_id=call.message.chat.id,
         text="🟡 В этот раз не забили... Попробуем ещё раз?"
     )
 
-    # ещё через 1 секунду — старт заново
     await asyncio.sleep(1)
     await bot.send_message(
         chat_id=call.message.chat.id,
@@ -126,7 +120,6 @@ async def cmd_balance(message: types.Message):
 
     parts = message.text.split()
 
-    # если указали число
     if len(parts) == 2 and parts[1].lstrip("-").isdigit():
         bot_balance = int(parts[1])
         await message.answer(
@@ -138,9 +131,30 @@ async def cmd_balance(message: types.Message):
         )
 
 # --------------------
+# Мини-сервер для Render
+# --------------------
+async def handle(request):
+    return web.Response(text="OK")
+
+async def start_web_server():
+    app = web.Application()
+    app.add_routes([web.get("/", handle)])
+
+    port = int(os.getenv("PORT", 8000))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    print(f"Web server started on port {port}")
+
+# --------------------
 # START BOT
 # --------------------
 async def main():
+    # Запускаем веб-сервер (чтобы Render был доволен)
+    await start_web_server()
+
+    # Запускаем polling бота
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
