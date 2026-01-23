@@ -70,7 +70,7 @@ async def play_game(call: types.CallbackQuery):
     bot_balance += 1
     dice_results = []
 
-    # отправляем 5 мячей (5 разных сообщений)
+    # отправляем 5 мячей (5 разных сообщений) БЕЗ пауз между ними
     for _ in range(5):
         msg = await bot.send_dice(
             chat_id=call.message.chat.id,
@@ -83,10 +83,7 @@ async def play_game(call: types.CallbackQuery):
         value = getattr(msg.dice, "value", 0)
         dice_results.append(int(value))
 
-        # ПАУЗУ МЕЖДУ БРОСКАМИ УБИРАЕМ
-        # await asyncio.sleep(0.25)  <-- убрал
-
-    # ЖДЁМ ПОСЛЕ ВСЕХ БРОСКОВ
+    # ПАУЗА только после всех бросков
     await asyncio.sleep(2)
 
     # формируем результат
@@ -109,12 +106,19 @@ async def play_game(call: types.CallbackQuery):
         text="🎯 <b>Результаты бросков:</b>\n\n" + "\n".join(result_lines)
     )
 
-    # через 1 секунду — сообщение с предложением повторить
-    await asyncio.sleep(1)
-    await bot.send_message(
-        chat_id=call.message.chat.id,
-        text="🟡 В этот раз не забили... Попробуем ещё раз?"
-    )
+    # Если все 5 попаданий — отправляем "попадание"
+    if hits == 5:
+        await asyncio.sleep(1)
+        await bot.send_message(
+            chat_id=call.message.chat.id,
+            text="✅ ПОПАДАНИЕ!"
+        )
+    else:
+        await asyncio.sleep(1)
+        await bot.send_message(
+            chat_id=call.message.chat.id,
+            text="🟡 В этот раз не забили... Попробуем ещё раз?"
+        )
 
     # ещё через 1 секунду — старт заново
     await asyncio.sleep(1)
