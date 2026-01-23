@@ -28,11 +28,11 @@ if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
 
 GROUP_ID = None
-if GROUP_ID_RAW and GROUP_ID_RAW.lstrip("-").lstrip("0").isdigit():
-    try:
+try:
+    if GROUP_ID_RAW is not None and GROUP_ID_RAW != "":
         GROUP_ID = int(GROUP_ID_RAW)
-    except Exception:
-        GROUP_ID = None
+except Exception:
+    GROUP_ID = None
 
 # --------------------
 # BOT
@@ -50,12 +50,24 @@ db_pool: asyncpg.Pool | None = None
 bot_balance: int = 0
 
 # --------------------
-# UI
+# UI / КНОПКИ
 # --------------------
+# Формат: (кол-во мячей, стоимость/звёзды)
+BUTTONS = [
+    (5, 1),
+    (4, 2),
+    (3, 3),
+    (2, 4),
+    (1, 8),
+]
+
 def start_kb():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🏀 5 мячей • 1⭐", callback_data="play_5")]
-    ])
+    keyboard = []
+    for count, cost in BUTTONS:
+        text = f"🏀 {count} мяч{'а' if count==1 else 'ей'} • {cost}⭐"
+        callback = f"play_{count}_{cost}"
+        keyboard.append([InlineKeyboardButton(text=text, callback_data=callback)])
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 START_TEXT = (
     "<b>🏀 баскетбол за подарки</b>\n\n"
@@ -69,12 +81,10 @@ async def init_db():
     global db_pool, bot_balance
 
     if not DATABASE_URL:
-        log.warning("DATABASE_URL not set — бот будет работать без БД (только in-memory).")
+        log.warning("DATABASE_URL not set — бот будет работать без БД (in-memory).")
         return
 
     try:
-        # Если в DATABASE_URL уже указан sslmode=require, asyncpg обычно обрабатывает.
-        # Здесь даём небольшой пул и таймауты.
         db_pool = await asyncpg.create_pool(
             DATABASE_URL,
             min_size=1,
@@ -108,11 +118,6 @@ async def init_db():
 # Баланс — атомарные операции
 # --------------------
 async def change_balance(delta: int, notify_group: bool = True, note: str | None = None):
-    """
-    Атомарно меняет баланс на delta и возвращает новое значение.
-    Если БД недоступна — меняет in-memory.
-    Если notify_group=True и GROUP_ID задан — шлёт уведомление в группу.
-    """
     global bot_balance, db_pool
 
     if db_pool:
@@ -125,8 +130,11 @@ async def change_balance(delta: int, notify_group: bool = True, note: str | None
                 if row and row.get("value") is not None:
                     bot_balance = int(row["value"])
                 else:
-                    # на случай, если строка не существовала
-                    await conn.execute("INSERT INTO bot_state(key, value) VALUES('balance', $1) ON CONFLICT (key) DO UPDATE SET value = bot_state.value + $1", delta)
+                    # случай, если записи не было
+                    await conn.execute(
+                        "INSERT INTO bot_state(key, value) VALUES('balance', $1) ON CONFLICT (key) DO UPDATE SET value = bot_state.value + $1",
+                        delta
+                    )
                     bot_balance = int(await conn.fetchval("SELECT value FROM bot_state WHERE key='balance'"))
         except Exception:
             log.exception("CHANGE_BALANCE FAILED — using in-memory fallback")
@@ -134,7 +142,6 @@ async def change_balance(delta: int, notify_group: bool = True, note: str | None
     else:
         bot_balance += delta
 
-    # уведомление
     if notify_group and GROUP_ID:
         try:
             prefix = f"{note}\n" if note else ""
@@ -145,16 +152,15 @@ async def change_balance(delta: int, notify_group: bool = True, note: str | None
     return bot_balance
 
 async def set_balance_absolute(value: int, notify_group: bool = True):
-    """
-    Устанавливает баланс в value (атомарно).
-    """
     global bot_balance, db_pool
 
     if db_pool:
         try:
             async with db_pool.acquire() as conn:
-                # гарантируем, что запись существует, затем меняем
-                await conn.execute("INSERT INTO bot_state (key, value) VALUES ('balance', $1) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value", value)
+                await conn.execute(
+                    "INSERT INTO bot_state (key, value) VALUES ('balance', $1) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+                    value
+                )
                 bot_balance = int(await conn.fetchval("SELECT value FROM bot_state WHERE key='balance'"))
         except Exception:
             log.exception("SET_BALANCE FAILED — using in-memory fallback")
@@ -178,27 +184,50 @@ async def cmd_start(message: types.Message):
     await message.answer(START_TEXT, reply_markup=start_kb())
 
 # --------------------
-# ИГРА: отправляем мячи с паузой 0.5 с, но финалы — не ранее, чем через 5 с от первого броска
+# Обработчик нажатий на кнопки вида play_{count}_{cost}
 # --------------------
-@dp.callback_query(F.data == "play_5")
-async def play_game(call: types.CallbackQuery):
+@dp.callback_query(lambda c: c.data and c.data.startswith("play_"))
+async def play_various(call: types.CallbackQuery):
     await call.answer()
 
-    # 1) +1 к балансу за одно нажатие кнопки (атомарно уже)
-    await change_balance(1, notify_group=True, note="➕ +1 за нажатие кнопки — начислено")
+    data = call.data or ""
+    parts = data.split("_")
+    # ожидаем play_{count}_{cost}
+    try:
+        count = int(parts[1]) if len(parts) > 1 else 5
+    except Exception:
+        count = 5
+    try:
+        cost = int(parts[2]) if len(parts) > 2 else 1
+    except Exception:
+        cost = 1
 
-    # 2) отправляем 5 мячей с задержкой 0.5s между ними
+    # ограничения
+    if count < 1:
+        count = 1
+    if count > 20:
+        count = 20  # предохранитель
+
+    # 1) начисляем стоимость за нажатие (одно начисление)
+    note = f"➕ +{cost} за нажатие ({count} мяч{'а' if count==1 else 'ей'})"
+    await change_balance(cost, notify_group=True, note=note)
+
+    # 2) отправляем count мячей с паузой 0.5s между ними
     messages = []
     first_send_time = None
-    for i in range(5):
-        msg = await bot.send_dice(call.message.chat.id, emoji="🏀")
-        if i == 0:
+    for i in range(count):
+        try:
+            msg = await bot.send_dice(call.message.chat.id, emoji="🏀")
+        except Exception:
+            log.exception("Failed to send dice")
+            # если не получилось отправить — пропускаем
+            continue
+        if first_send_time is None:
             first_send_time = time.monotonic()
         messages.append(msg)
-        # задержка между бросками 0.5 секунды (последнего после отправки не ждём перед ожиданием 5s)
         await asyncio.sleep(0.5)
 
-    # 3) дождёмся чтобы от первого броска прошло минимум 5 секунд
+    # 3) ждать до 5 секунд от первого отправленного мяча
     if first_send_time is None:
         first_send_time = time.monotonic()
     elapsed = time.monotonic() - first_send_time
@@ -206,49 +235,47 @@ async def play_game(call: types.CallbackQuery):
     if wait_for > 0:
         await asyncio.sleep(wait_for)
 
-    # 4) собираем результаты и считаем попадания
-    hits = 0
+    # 4) анализ результатов (учитываем именно отправленные месседжи)
     results = []
+    hits = 0
     for msg in messages:
-        value = getattr(msg.dice, "value", 0) or 0
+        val = getattr(msg, "dice", None)
+        value = getattr(val, "value", 0) if val else 0
         results.append(int(value))
         if int(value) >= 4:
             hits += 1
 
-    # 5) если все 5 попаданий — списываем -15 и уведомляем группу о потере 15
-    if hits == 5:
-        # сначала списываем
+    sent_count = len(results)
+
+    # 5) если все отправленные мячи попали (и было хотя бы 1 отправлено) — списание -15
+    if sent_count > 0 and hits == sent_count:
         new_bal = await change_balance(-15, notify_group=False)
-        # уведомляем группу о потере (в тексте показываем текущий баланс после потери)
         if GROUP_ID:
             try:
                 await bot.send_message(GROUP_ID, f"⚠️ Произведено списание: <b>-15</b>\n💰 Текущий баланс после списания: <b>{new_bal}</b>")
             except Exception:
                 log.exception("Failed to send group message about -15")
 
-    # 6) отправляем результаты в чат (это произойдёт не раньше, чем через 5 секунд от 1го броска)
+    # 6) отправляем результаты в чат
     text_lines = ["🎯 <b>Результаты бросков:</b>\n"]
     for i, v in enumerate(results, start=1):
         text_lines.append(f"{i}. {'✅ Попал' if v >= 4 else '❌ Промах'} ( {v} )")
+    if not results:
+        text_lines.append("⚠️ Не удалось отправить ни одного мяча.")
 
     await bot.send_message(call.message.chat.id, "\n".join(text_lines))
 
     await asyncio.sleep(1)
     await bot.send_message(
         call.message.chat.id,
-        "✅ ПОПАДАНИЕ!" if hits == 5 else "🟡 Не все попали. Попробуем ещё?"
+        "✅ ПОПАДАНИЕ!" if sent_count > 0 and hits == sent_count else "🟡 Не все попали. Попробуем ещё?"
     )
 
     await asyncio.sleep(1)
-    await bot.send_message(
-        call.message.chat.id,
-        START_TEXT,
-        reply_markup=start_kb()
-    )
+    await bot.send_message(call.message.chat.id, START_TEXT, reply_markup=start_kb())
 
 # --------------------
 # Команда "баланс" — показывает или устанавливает
-# Поддерживает: "/баланс", "/баланс@BotName", "баланс", "баланс 123"
 # --------------------
 @dp.message()
 async def handle_balance_commands(message: types.Message):
@@ -256,24 +283,20 @@ async def handle_balance_commands(message: types.Message):
     if not text:
         return
 
-    # приводим к нижнему для сравнения, но сохраняем оригинал для числа
     lowered = text.lower()
-    # проверяем команды: возможны варианты "/баланс", "/баланс@BotName", "баланс"
     if not (lowered.startswith("/баланс") or lowered.split()[0] == "баланс"):
-        return  # не наша команда
+        return
 
     parts = text.split()
-    # если передано число — устанавливаем баланс
     if len(parts) >= 2 and parts[1].lstrip("-").isdigit():
         new_value = int(parts[1])
         await set_balance_absolute(new_value, notify_group=True)
         await message.answer(f"💰 Баланс установлен: <b>{bot_balance}</b>")
     else:
-        # просто показать текущий баланс
         await message.answer(f"💰 Текущий баланс: <b>{bot_balance}</b>")
 
 # --------------------
-# WEB для Render (health)
+# WEB (health)
 # --------------------
 async def handle(request):
     return web.Response(text="OK")
