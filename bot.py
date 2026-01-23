@@ -54,12 +54,13 @@ bot_balance: int = 0
 # UI / КНОПКИ и конфиг
 # --------------------
 # Формат: (кол-во мячей, стоимость/звёзды)
+# Обновлённые цены: 3 -> 4⭐, 2 -> 6⭐
 BUTTONS = [
     (6, 0),  # бесплатно (использует free_throws у пользователя)
     (5, 1),
     (4, 2),
-    (3, 3),
-    (2, 4),
+    (3, 4),  # changed to 4⭐
+    (2, 6),  # changed to 6⭐
     (1, 8),
 ]
 
@@ -72,7 +73,6 @@ def word_form_mяч(count: int) -> str:
 def build_main_keyboard():
     kb = []
     for count, cost in BUTTONS:
-        # для "бесплатно" показываем "бесплатно", иначе cost + "⭐"
         if cost == 0:
             cost_text = "бесплатно"
         else:
@@ -81,7 +81,6 @@ def build_main_keyboard():
         text = f"🏀 {count} {noun} • {cost_text}"
         cb = f"play_{count}_{cost}"
         kb.append([InlineKeyboardButton(text=text, callback_data=cb)])
-    # реферальная кнопка внизу
     kb.append([InlineKeyboardButton(text="👥 +Бросок за друга", callback_data="ref_menu")])
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
@@ -98,12 +97,10 @@ REF_TEXT_TEMPLATE = (
     "<code>{link}</code>"
 )
 
-# клавиатура "назад" для реферального экрана
 REF_BACK_KB = InlineKeyboardMarkup(inline_keyboard=[
     [InlineKeyboardButton(text="◀️ Назад", callback_data="ref_back")]
 ])
 
-# reply-клавиатура (менюшка слева снизу)
 REPLY_MENU = ReplyKeyboardMarkup(
     keyboard=[[KeyboardButton(text="🏀 Сыграть в баскет")]],
     resize_keyboard=True,
@@ -122,7 +119,6 @@ async def init_db():
     try:
         db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5, timeout=15)
         async with db_pool.acquire() as conn:
-            # создаём таблицы: bot_state, users, referrals
             await conn.execute("""
             CREATE TABLE IF NOT EXISTS bot_state (
                 key TEXT PRIMARY KEY,
@@ -141,7 +137,6 @@ async def init_db():
                 inviter BIGINT NOT NULL
             );
             """)
-            # инициализация баланса
             row = await conn.fetchrow("SELECT value FROM bot_state WHERE key = 'balance'")
             if row:
                 bot_balance = int(row["value"])
@@ -154,28 +149,21 @@ async def init_db():
         db_pool = None
 
 # --------------------
-# Пользовательские операции (users/referrals)
+# Пользовательские операции
 # --------------------
 async def ensure_user(user_id: int):
-    """
-    Убедиться, что в users есть запись для user_id. Возвращает current free_throws.
-    """
-    global db_pool
     if db_pool:
         try:
             async with db_pool.acquire() as conn:
                 row = await conn.fetchrow("SELECT free_throws FROM users WHERE user_id = $1", user_id)
                 if row:
                     return int(row["free_throws"])
-                # создаём с free_throws = 1 по умолчанию
                 await conn.execute("INSERT INTO users (user_id, free_throws) VALUES ($1, 1) ON CONFLICT DO NOTHING", user_id)
                 return 1
         except Exception:
             log.exception("ensure_user DB failed")
-            # fallback to default
             return 1
     else:
-        # in-memory fallback - we cannot persist between restarts, use bot-level dict (store in attribute)
         if not hasattr(bot, "_in_memory_users"):
             bot._in_memory_users = {}
         if user_id not in bot._in_memory_users:
@@ -183,28 +171,21 @@ async def ensure_user(user_id: int):
         return bot._in_memory_users[user_id]
 
 async def change_user_free_throws(user_id: int, delta: int):
-    """
-    Меняет количество free_throws пользователя на delta (может быть отрицательным).
-    Возвращает новое значение.
-    """
-    global db_pool
     if db_pool:
         try:
             async with db_pool.acquire() as conn:
                 row = await conn.fetchrow("UPDATE users SET free_throws = free_throws + $1 WHERE user_id = $2 RETURNING free_throws", delta, user_id)
                 if row and row.get("free_throws") is not None:
-                    return int(row["free_throws"])
-                # если записи нет — вставляем её с default 1 и применяем изменение
+                    val = int(row["free_throws"])
+                    return max(val, 0)
                 await conn.execute("INSERT INTO users (user_id, free_throws) VALUES ($1, 1) ON CONFLICT (user_id) DO NOTHING", user_id)
                 row2 = await conn.fetchrow("UPDATE users SET free_throws = free_throws + $1 WHERE user_id = $2 RETURNING free_throws", delta, user_id)
                 if row2:
-                    return int(row2["free_throws"])
-                # fallback: return 1
+                    return max(int(row2["free_throws"]), 0)
                 return 1
         except Exception:
             log.exception("change_user_free_throws DB failed")
-            # fallback to in-memory
-    # in-memory
+    # in-memory fallback
     if not hasattr(bot, "_in_memory_users"):
         bot._in_memory_users = {}
     cur = bot._in_memory_users.get(user_id, 1)
@@ -221,7 +202,6 @@ async def get_user_free_throws(user_id: int) -> int:
                 row = await conn.fetchrow("SELECT free_throws FROM users WHERE user_id = $1", user_id)
                 if row:
                     return int(row["free_throws"])
-                # create default
                 await conn.execute("INSERT INTO users (user_id, free_throws) VALUES ($1, 1) ON CONFLICT (user_id) DO NOTHING", user_id)
                 return 1
         except Exception:
@@ -233,21 +213,14 @@ async def get_user_free_throws(user_id: int) -> int:
         return bot._in_memory_users.get(user_id, 1)
 
 async def try_add_referral(referred_user: int, inviter_user: int) -> bool:
-    """
-    Попытаться добавить запись о реферале. Если успешно (её не было ранее) — вернуть True и начислить inviter +1 free throw.
-    Иначе вернуть False.
-    """
-    global db_pool
     if db_pool:
         try:
             async with db_pool.acquire() as conn:
-                # пытаемся вставить запись; если уже есть — будет исключение уникальности или просто не вставит в ON CONFLICT
                 res = await conn.execute("INSERT INTO referrals (referred_user, inviter) VALUES ($1, $2) ON CONFLICT (referred_user) DO NOTHING", referred_user, inviter_user)
-                # res like "INSERT 0 1" when inserted, "INSERT 0 0" when skipped
                 if res and res.endswith(" 1"):
-                    # начисляем inviter +1 free throw
-                    new_free = await change_user_free_throws(inviter_user, 1)
-                    # уведомляем inviter
+                    # award inviter
+                    await change_user_free_throws(inviter_user, 1)
+                    # notify inviter only
                     try:
                         await bot.send_message(inviter_user, "🔥 Вы получили +1 бесплатный бросок за приглашённого друга")
                     except Exception:
@@ -258,13 +231,11 @@ async def try_add_referral(referred_user: int, inviter_user: int) -> bool:
             log.exception("try_add_referral DB failed")
             return False
     else:
-        # in-memory: maintain bot._in_memory_referrals
         if not hasattr(bot, "_in_memory_referrals"):
             bot._in_memory_referrals = {}
         if referred_user in bot._in_memory_referrals:
             return False
         bot._in_memory_referrals[referred_user] = inviter_user
-        # award inviter
         await change_user_free_throws(inviter_user, 1)
         try:
             await bot.send_message(inviter_user, "🔥 Вы получили +1 бесплатный бросок за приглашённого друга")
@@ -284,7 +255,6 @@ async def change_balance(delta: int, notify_group: bool = True, note: Optional[s
                 if row and row.get("value") is not None:
                     bot_balance = int(row["value"])
                 else:
-                    # create if not exists then update
                     await conn.execute("INSERT INTO bot_state (key, value) VALUES ('balance', $1) ON CONFLICT (key) DO UPDATE SET value = bot_state.value + $1", delta)
                     bot_balance = int(await conn.fetchval("SELECT value FROM bot_state WHERE key='balance'"))
         except Exception:
@@ -326,15 +296,12 @@ async def set_balance_absolute(value: int, notify_group: bool = True):
 # --------------------
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
-    """
-    Регистрируем пользователя, обрабатываем реферальный payload, показываем стартовое меню и reply-кнопку.
-    """
     user = message.from_user
     user_id = user.id
-    # создаём пользователя, если нет
-    free = await ensure_user(user_id)
+    # ensure user exists (creates with 1 free throw by default)
+    await ensure_user(user_id)
 
-    # Если payload (пример: "/start 12345"), Telegram присылает message.text вроде "/start 12345"
+    # payload handling (no message to the referred user)
     payload = ""
     try:
         text = (message.text or "").strip()
@@ -345,35 +312,27 @@ async def cmd_start(message: types.Message):
         payload = ""
 
     if payload:
-        # пытаемся интерпретировать payload как inviter_id (int)
         try:
             inviter_id = int(payload)
             if inviter_id != user_id:
-                # пытаемся добавить реферал и начислить inviter +1 (если ещё не было)
-                added = await try_add_referral(user_id, inviter_id)
-                if added:
-                    # можно уведомить нового пользователя, что всё ок
-                    try:
-                        await message.answer("🔥 Спасибо! Ваш друг получил бонус, и вы получили +1 бесплатный бросок.")
-                    except Exception:
-                        pass
+                # try add referral; inviter is notified inside try_add_referral
+                await try_add_referral(user_id, inviter_id)
         except Exception:
             pass
 
-    # Показываем reply-клавиатуру (менюшка слева снизу)
-    try:
-        await message.answer("Добро пожаловать! Нажмите кнопку в меню, чтобы играть.", reply_markup=REPLY_MENU)
-    except Exception:
-        # fallback: просто send start inline
-        pass
-
-    # Также отправляем (или обновляем) основное сообщение с inline-кнопками
+    # send reply-menu hint (NOT "Добро пожаловать..."), and main inline menu
     free = await get_user_free_throws(user_id)
     start_text = START_TEXT_TEMPLATE.format(free_throws=free)
+    # Send reply keyboard hint (short neutral text)
+    try:
+        await message.answer("Меню внизу — откройте для быстрого доступа.", reply_markup=REPLY_MENU)
+    except Exception:
+        log.exception("Failed to send reply menu hint")
+    # Send main inline message
     try:
         await message.answer(start_text, reply_markup=build_main_keyboard())
     except Exception:
-        log.exception("Failed to send main menu on /start")
+        log.exception("Failed to send main start message")
 
 # --------------------
 # Обработчик reply-кнопки "🏀 Сыграть в баскет"
@@ -390,9 +349,7 @@ async def open_main_menu_message(message: types.Message):
 # --------------------
 @dp.callback_query(lambda c: c.data == "ref_menu")
 async def ref_menu(call: types.CallbackQuery):
-    # показать реферальный экран для пользователя
     user_id = call.from_user.id
-    # get bot username to build link
     try:
         me = await bot.get_me()
         bot_username = me.username or ""
@@ -403,7 +360,6 @@ async def ref_menu(call: types.CallbackQuery):
     try:
         await call.message.edit_text(text, reply_markup=REF_BACK_KB, parse_mode=ParseMode.HTML)
     except Exception:
-        # в случае ошибки — отправим новое сообщение
         await call.message.answer(text, reply_markup=REF_BACK_KB)
 
 @dp.callback_query(lambda c: c.data == "ref_back")
@@ -434,18 +390,16 @@ async def play_various(call: types.CallbackQuery):
     except Exception:
         cost = 1
 
-    # guard
     if count < 1:
         count = 1
     if count > 20:
         count = 20
 
-    # Если это бесплатная кнопка (cost==0) — используем free_throws
+    # Free button handling (cost == 0)
     if cost == 0:
         free = await get_user_free_throws(user_id)
         if free < 1:
-            # показываем реферальный экран вместо запуска бросков
-            # reuse ref_menu behaviour but as edit
+            # show referral screen
             try:
                 me = await bot.get_me()
                 bot_username = me.username or ""
@@ -459,20 +413,14 @@ async def play_various(call: types.CallbackQuery):
                 await call.message.answer(text, reply_markup=REF_BACK_KB)
             return
         else:
-            # снимаем 1 free throw
-            new_free = await change_user_free_throws(user_id, -1)
-            # optional: inform user privately (we'll send ephemeral note in chat)
-            try:
-                await call.message.reply(f"🔥 Использован бесплатный бросок. Осталось: {new_free}")
-            except Exception:
-                pass
-            # cost remains 0; we do not change bot balance
+            # consume one free throw silently (no extra message)
+            await change_user_free_throws(user_id, -1)
     else:
-        # начисляем cost за нажатие (одно начисление)
+        # add cost to bot balance (one-time per press)
         note = f"➕ +{cost} за нажатие ({count} {word_form_mяч(count)})"
         await change_balance(cost, notify_group=True, note=note)
 
-    # 2) отправляем count мячей с задержкой 0.5s между ними
+    # send dice with 0.5s intervals
     messages = []
     first_send_time = None
     for i in range(count):
@@ -486,7 +434,7 @@ async def play_various(call: types.CallbackQuery):
         messages.append(msg)
         await asyncio.sleep(0.5)
 
-    # 3) ждать до 5 секунд от первого отправленного мяча
+    # wait until 5s since first send
     if first_send_time is None:
         first_send_time = time.monotonic()
     elapsed = time.monotonic() - first_send_time
@@ -494,7 +442,7 @@ async def play_various(call: types.CallbackQuery):
     if wait_for > 0:
         await asyncio.sleep(wait_for)
 
-    # 4) анализ результатов (без нумерации)
+    # collect results (no numbering, only Попал/Промах)
     results = []
     hits = 0
     for msg in messages:
@@ -506,7 +454,7 @@ async def play_various(call: types.CallbackQuery):
 
     sent_count = len(results)
 
-    # 5) если все отправленные мячи попали (и было хотя бы 1) — списание -15
+    # if all sent balls hit -> -15 and notify group
     if sent_count > 0 and hits == sent_count:
         new_bal = await change_balance(-15, notify_group=False)
         if GROUP_ID:
@@ -515,14 +463,12 @@ async def play_various(call: types.CallbackQuery):
             except Exception:
                 log.exception("Failed to send group message about -15")
 
-    # 6) отправляем результаты в чат (без нумерации)
+    # send results in chat (simple lines)
     text_lines = ["🎯 <b>Результаты бросков:</b>\n"]
     for v in results:
         text_lines.append("✅ Попал" if v >= 4 else "❌ Промах")
-
     if not results:
         text_lines.append("⚠️ Не удалось отправить ни одного мяча.")
-
     await bot.send_message(call.message.chat.id, "\n".join(text_lines))
 
     await asyncio.sleep(1)
@@ -532,7 +478,7 @@ async def play_various(call: types.CallbackQuery):
     )
 
     await asyncio.sleep(1)
-    # отправляем стартовое сообщение снова (с актуальным числом free_throws)
+    # send updated main menu with current free throws
     free_now = await get_user_free_throws(user_id)
     start_text = START_TEXT_TEMPLATE.format(free_throws=free_now)
     await bot.send_message(call.message.chat.id, start_text, reply_markup=build_main_keyboard())
@@ -546,7 +492,6 @@ async def handle_balance_commands(message: types.Message):
     if not text:
         return
     lowered = text.lower()
-    # поддерживаем варианты: "/баланс", "/баланс@Bot", "баланс"
     if not (lowered.startswith("/баланс") or lowered.split()[0] == "баланс"):
         return
     parts = text.split()
@@ -579,7 +524,6 @@ async def start_web():
 async def main():
     log.info("🚀 BOT STARTING")
     await init_db()
-    # pre-warm bot username (used for referral links)
     try:
         await bot.get_me()
     except Exception:
