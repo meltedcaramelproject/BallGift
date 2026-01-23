@@ -67,9 +67,7 @@ async def play_game(call: types.CallbackQuery):
 
     await call.answer()
 
-    # +1 к балансу (за игру)
     bot_balance += 1
-
     dice_results = []
 
     # отправляем 5 мячей (5 разных сообщений)
@@ -79,36 +77,27 @@ async def play_game(call: types.CallbackQuery):
             emoji="🏀"
         )
 
-        # ждём анимацию (обычно ~2.5-3s). даём небольшой запас.
+        # ждём анимацию (чтобы value успел прийти)
         await asyncio.sleep(3)
 
-        # защищённо читаем значение — может быть None в редких случаях
-        value = None
-        try:
-            value = getattr(msg.dice, "value", None)
-        except Exception:
-            value = None
-
-        # если значение не пришло — ставим 0 (будет считаться промахом)
-        if value is None:
-            logging.warning("Dice value is None for message id %s", msg.message_id)
-            value = 0
-
+        value = getattr(msg.dice, "value", 0)
         dice_results.append(int(value))
 
-        # небольшой интервал между бросками (чтобы анимации не пересекались совсем)
-        await asyncio.sleep(0.25)
+        # ПАУЗУ МЕЖДУ БРОСКАМИ УБИРАЕМ
+        # await asyncio.sleep(0.25)  <-- убрал
+
+    # ЖДЁМ ПОСЛЕ ВСЕХ БРОСКОВ
+    await asyncio.sleep(2)
 
     # формируем результат
     result_lines = []
     hits = 0
 
     for i, value in enumerate(dice_results, start=1):
-        if value == 6:
+        if value >= 4:  # 4,5,6 = попадание
             result_lines.append(f"{i}. ✅ Попал! (значение: {value})")
             hits += 1
         else:
-            # показываем значение для диагностики
             result_lines.append(f"{i}. ❌ Промах (значение: {value})")
 
     # если все попали — минус 15
