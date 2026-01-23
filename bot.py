@@ -2,20 +2,32 @@ import asyncio
 import logging
 import os
 
+import asyncpg
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart, Command
 from aiogram.client.default import DefaultBotProperties
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-
 from aiohttp import web
 
+# --------------------
+# НАСТРОЙКИ
+# --------------------
 logging.basicConfig(level=logging.INFO)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+DATABASE_URL = os.getenv("DATABASE_URL")
+GROUP_ID = int(os.getenv("GROUP_ID", "0"))
+
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
 
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL is not set")
+
+# --------------------
+# BOT
+# --------------------
 bot = Bot(
     token=BOT_TOKEN,
     default=DefaultBotProperties(parse_mode=ParseMode.HTML)
@@ -23,8 +35,9 @@ bot = Bot(
 dp = Dispatcher()
 
 # --------------------
-# ГЛОБАЛЬНЫЙ БАЛАНС БОТА
+# DB
 # --------------------
+db_pool: asyncpg.Pool | None = None
 bot_balance = 0
 
 # --------------------
@@ -32,155 +45,143 @@ bot_balance = 0
 # --------------------
 def start_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(
-                text="🏀 5 мячей • 1⭐",
-                callback_data="play_5"
-            )
-        ]
+        [InlineKeyboardButton(text="🏀 5 мячей • 1⭐", callback_data="play_5")]
     ])
 
-# --------------------
-# ТЕКСТ СТАРТА
-# --------------------
 START_TEXT = (
     "<b>🏀 баскетбол за подарки</b>\n\n"
     "попади мячом в кольцо каждым броском и получи крутой подарок 🎁"
 )
 
 # --------------------
+# ИНИЦИАЛИЗАЦИЯ БД (СОЗДАЁТ ТАБЛИЦУ САМ)
+# --------------------
+async def init_db():
+    global db_pool, bot_balance
+
+    db_pool = await asyncpg.create_pool(DATABASE_URL)
+
+    async with db_pool.acquire() as conn:
+        # создаём таблицу
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS bot_state (
+            key TEXT PRIMARY KEY,
+            value BIGINT NOT NULL
+        )
+        """)
+
+        # проверяем баланс
+        row = await conn.fetchrow(
+            "SELECT value FROM bot_state WHERE key='balance'"
+        )
+
+        if row:
+            bot_balance = row["value"]
+        else:
+            await conn.execute(
+                "INSERT INTO bot_state (key, value) VALUES ('balance', 0)"
+            )
+            bot_balance = 0
+
+    logging.info(f"DB initialized. Balance = {bot_balance}")
+
+async def set_balance(value: int):
+    global bot_balance
+    bot_balance = value
+
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE bot_state SET value=$1 WHERE key='balance'",
+            value
+        )
+
+    if GROUP_ID:
+        await bot.send_message(
+            GROUP_ID,
+            f"💰 Баланс бота: <b>{bot_balance}</b>"
+        )
+
+# --------------------
 # /start
 # --------------------
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
-    await message.answer(
+    await message.answer(START_TEXT, reply_markup=start_kb())
+
+# --------------------
+# ИГРА (БЕЗ ПАУЗ МЕЖДУ БРОСКАМИ)
+# --------------------
+@dp.callback_query(F.data == "play_5")
+async def play_game(call: types.CallbackQuery):
+    await call.answer()
+
+    # отправляем 5 мячей почти одновременно
+    tasks = [
+        bot.send_dice(call.message.chat.id, emoji="🏀")
+        for _ in range(5)
+    ]
+    messages = await asyncio.gather(*tasks)
+
+    results = []
+    hits = 0
+
+    for msg in messages:
+        value = msg.dice.value
+        results.append(value)
+
+        # +1 баланс после каждого броска
+        await set_balance(bot_balance + 1)
+
+        if value >= 4:
+            hits += 1
+
+    # если все попали — минус 15
+    if hits == 5:
+        await set_balance(bot_balance - 15)
+
+    # вывод результата
+    text = ["🎯 <b>Результаты бросков:</b>\n"]
+    for i, v in enumerate(results, 1):
+        text.append(
+            f"{i}. {'✅ Попал' if v >= 4 else '❌ Промах'} ( {v} )"
+        )
+
+    await bot.send_message(call.message.chat.id, "\n".join(text))
+
+    await asyncio.sleep(1)
+
+    await bot.send_message(
+        call.message.chat.id,
+        "✅ ПОПАДАНИЕ!" if hits == 5 else "🟡 Не все попали. Попробуем ещё?"
+    )
+
+    await asyncio.sleep(1)
+    await bot.send_message(
+        call.message.chat.id,
         START_TEXT,
         reply_markup=start_kb()
     )
 
 # --------------------
-# КНОПКА ИГРЫ
+# /баланс
 # --------------------
-@dp.callback_query(F.data == "play_5")
-async def play_game(call: types.CallbackQuery):
-    global bot_balance
-
-    await call.answer()
-
-    bot_balance += 1
-    dice_results = []
-
-    # отправляем 5 мячей (5 разных сообщений) БЕЗ пауз между ними
-    for _ in range(5):
-        msg = await bot.send_dice(
-            chat_id=call.message.chat.id,
-            emoji="🏀"
-        )
-
-        # ждём анимацию (чтобы value успел прийти)
-        await asyncio.sleep(3)
-
-        value = getattr(msg.dice, "value", 0)
-        dice_results.append(int(value))
-
-    # ПАУЗА только после всех бросков
-    await asyncio.sleep(2)
-
-    # формируем результат
-    result_lines = []
-    hits = 0
-
-    for i, value in enumerate(dice_results, start=1):
-        if value >= 4:  # 4,5,6 = попадание
-            result_lines.append(f"{i}. ✅ Попал! (значение: {value})")
-            hits += 1
-        else:
-            result_lines.append(f"{i}. ❌ Промах (значение: {value})")
-
-    # если все попали — минус 15
-    if hits == 5:
-        bot_balance -= 15
-
-    await bot.send_message(
-        chat_id=call.message.chat.id,
-        text="🎯 <b>Результаты бросков:</b>\n\n" + "\n".join(result_lines)
-    )
-
-    # Если все 5 попаданий — отправляем "попадание"
-    if hits == 5:
-        await asyncio.sleep(1)
-        await bot.send_message(
-            chat_id=call.message.chat.id,
-            text="✅ ПОПАДАНИЕ!"
-        )
-    else:
-        await asyncio.sleep(1)
-        await bot.send_message(
-            chat_id=call.message.chat.id,
-            text="🟡 В этот раз не забили... Попробуем ещё раз?"
-        )
-
-    # ещё через 1 секунду — старт заново
-    await asyncio.sleep(1)
-    await bot.send_message(
-        chat_id=call.message.chat.id,
-        text=START_TEXT,
-        reply_markup=start_kb()
-    )
-
-# --------------------
-# /баланс [число] — основной хендлер через Command
-# --------------------
-@dp.message(Command(commands=["баланс"]))
-async def cmd_balance_command(message: types.Message):
-    global bot_balance
-
+@dp.message(Command("баланс"))
+async def cmd_balance(message: types.Message):
     parts = (message.text or "").split()
 
-    # если указали число: /баланс 123
     if len(parts) == 2 and parts[1].lstrip("-").isdigit():
-        bot_balance = int(parts[1])
-        await message.answer(
-            f"💰 Баланс бота установлен: <b>{bot_balance}</b>"
-        )
+        await set_balance(int(parts[1]))
+        await message.answer(f"💰 Баланс установлен: <b>{bot_balance}</b>")
     else:
-        await message.answer(
-            f"💰 Текущий баланс бота: <b>{bot_balance}</b>"
-        )
+        await message.answer(f"💰 Текущий баланс: <b>{bot_balance}</b>")
 
 # --------------------
-# Резервный текстовый хендлер: на случай, если сообщение приходит как "баланс" без слеша
-# --------------------
-@dp.message()
-async def fallback_text_handlers(message: types.Message):
-    text = (message.text or "").strip()
-    if not text:
-        return
-
-    parts = text.split()
-    cmd = parts[0].lower()
-
-    # поддерживаем варианты: "баланс" или "/баланс"
-    if cmd in ("баланс", "/баланс"):
-        global bot_balance
-
-        if len(parts) == 2 and parts[1].lstrip("-").isdigit():
-            bot_balance = int(parts[1])
-            await message.answer(
-                f"💰 Баланс бота установлен: <b>{bot_balance}</b>"
-            )
-        else:
-            await message.answer(
-                f"💰 Текущий баланс бота: <b>{bot_balance}</b>"
-            )
-
-# --------------------
-# Мини-сервер для Render (чтобы не было ошибки "No open ports detected")
+# WEB SERVER (Render)
 # --------------------
 async def handle(request):
     return web.Response(text="OK")
 
-async def start_web_server():
+async def start_web():
     app = web.Application()
     app.add_routes([web.get("/", handle), web.get("/health", handle)])
 
@@ -189,16 +190,13 @@ async def start_web_server():
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    print(f"Web server started on port {port}")
 
 # --------------------
-# START BOT
+# START
 # --------------------
 async def main():
-    # Запускаем веб-сервер (чтобы Render был доволен)
-    await start_web_server()
-
-    # Запускаем polling бота
+    await init_db()
+    await start_web()
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
