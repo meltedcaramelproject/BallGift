@@ -5,7 +5,7 @@ import os
 import asyncpg
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.enums import ParseMode
-from aiogram.filters import CommandStart, Command
+from aiogram.filters import CommandStart
 from aiogram.client.default import DefaultBotProperties
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiohttp import web
@@ -14,7 +14,7 @@ from aiohttp import web
 # ЛОГИ
 # --------------------
 logging.basicConfig(level=logging.INFO)
-log = logging.getLogger(__name__)
+log = logging.getLogger("bot")
 
 # --------------------
 # ENV
@@ -46,7 +46,7 @@ db_pool: asyncpg.Pool | None = None
 bot_balance: int = 0
 
 # --------------------
-# КНОПКИ
+# UI
 # --------------------
 def start_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -65,7 +65,7 @@ async def init_db():
     global db_pool, bot_balance
 
     if not DATABASE_URL:
-        log.warning("DATABASE_URL not set — бот работает БЕЗ базы")
+        log.error("DATABASE_URL НЕ УСТАНОВЛЕН")
         return
 
     try:
@@ -73,7 +73,8 @@ async def init_db():
             DATABASE_URL,
             min_size=1,
             max_size=5,
-            timeout=10
+            ssl="require",  # 🔥 КЛЮЧЕВО ДЛЯ NEON
+            timeout=15
         )
 
         async with db_pool.acquire() as conn:
@@ -96,10 +97,10 @@ async def init_db():
                 )
                 bot_balance = 0
 
-        log.info(f"DB OK. Balance = {bot_balance}")
+        log.info(f"✅ DB CONNECTED. Balance = {bot_balance}")
 
-    except Exception as e:
-        log.exception("DB INIT FAILED")
+    except Exception:
+        log.exception("❌ DB CONNECTION FAILED")
         db_pool = None
 
 # --------------------
@@ -109,17 +110,15 @@ async def set_balance(value: int):
     global bot_balance
     bot_balance = value
 
-    if not db_pool:
-        return
-
-    try:
-        async with db_pool.acquire() as conn:
-            await conn.execute(
-                "UPDATE bot_state SET value=$1 WHERE key='balance'",
-                value
-            )
-    except Exception:
-        log.exception("FAILED TO UPDATE BALANCE")
+    if db_pool:
+        try:
+            async with db_pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE bot_state SET value=$1 WHERE key='balance'",
+                    value
+                )
+        except Exception:
+            log.exception("FAILED TO UPDATE BALANCE")
 
     if GROUP_ID:
         try:
@@ -128,7 +127,7 @@ async def set_balance(value: int):
                 f"💰 Баланс бота: <b>{bot_balance}</b>"
             )
         except Exception:
-            log.exception("FAILED TO SEND GROUP MESSAGE")
+            pass
 
 # --------------------
 # /start
@@ -144,12 +143,10 @@ async def cmd_start(message: types.Message):
 async def play_game(call: types.CallbackQuery):
     await call.answer()
 
-    tasks = [
+    messages = await asyncio.gather(*[
         bot.send_dice(call.message.chat.id, emoji="🏀")
         for _ in range(5)
-    ]
-
-    messages = await asyncio.gather(*tasks)
+    ])
 
     hits = 0
     results = []
@@ -165,6 +162,9 @@ async def play_game(call: types.CallbackQuery):
 
     if hits == 5:
         await set_balance(bot_balance - 15)
+
+    # ⏳ ЖЁСТКАЯ ПАУЗА
+    await asyncio.sleep(5)
 
     text = ["🎯 <b>Результаты бросков:</b>\n"]
     for i, v in enumerate(results, 1):
@@ -188,13 +188,13 @@ async def play_game(call: types.CallbackQuery):
     )
 
 # --------------------
-# /баланс
+# /баланс (ЧИНИМ)
 # --------------------
-@dp.message(Command("баланс"))
+@dp.message(F.text.startswith("/баланс"))
 async def cmd_balance(message: types.Message):
-    parts = (message.text or "").split()
+    parts = message.text.split()
 
-    if len(parts) == 2 and parts[1].lstrip("-").isdigit():
+    if len(parts) > 1 and parts[1].lstrip("-").isdigit():
         await set_balance(int(parts[1]))
         await message.answer(f"💰 Баланс установлен: <b>{bot_balance}</b>")
     else:
@@ -208,12 +208,9 @@ async def handle(request):
 
 async def start_web():
     app = web.Application()
-    app.add_routes([
-        web.get("/", handle),
-        web.get("/health", handle),
-    ])
-
+    app.add_routes([web.get("/", handle)])
     port = int(os.getenv("PORT", "8000"))
+
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", port)
@@ -223,7 +220,7 @@ async def start_web():
 # MAIN
 # --------------------
 async def main():
-    log.info("BOT STARTING")
+    log.info("🚀 BOT STARTING")
     await init_db()
     await start_web()
     await dp.start_polling(bot)
