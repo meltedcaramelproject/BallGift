@@ -65,8 +65,8 @@ BUTTONS = {
     "p4": (4, 2, False, ""),
     "p3": (3, 4, False, ""),
     "p2": (2, 6, False, ""),
-    "p1": (1, 10, False, ""),   # single ball 10⭐
-    "prem1": (1, 15, True, "💎") # premium single ball 15⭐
+    "p1": (1, 10, False, ""),   # single ball 10⭐ (label will be "мяч")
+    "prem1": (1, 15, True, "💎") # premium single ball 15⭐ (label "мяч")
 }
 
 # Gift real-star costs and premium gifts
@@ -79,23 +79,28 @@ STAR_UNIT_MULTIPLIER = 1
 # Free cooldown seconds
 FREE_COOLDOWN = 3 * 60  # 3 minutes
 
-# Minimal wait after first throw before showing results (requirement changed to 7s)
+# Minimal wait after first throw before showing results (changed to 7s)
 MIN_WAIT_FROM_FIRST_THROW = 7.0
 
 # --------------------
 # UI Helpers
 # --------------------
 def word_form_mяч(count: int) -> str:
-    return "мяча" if 1 <= count <= 4 else "мячей"
+    # 1 -> "мяч", 2-4 -> "мяча", 5+ -> "мячей"
+    if count == 1:
+        return "мяч"
+    if 2 <= count <= 4:
+        return "мяча"
+    return "мячей"
 
 def build_main_keyboard(user_id: Optional[int] = None) -> InlineKeyboardMarkup:
     """
-    Layout requested:
+    Layout:
     Row1: 6
     Row2: 5,4
     Row3: 3,2
     Row4: 1, prem1
-    Row5: stars for friend
+    Row5: +3⭐ за друга
     """
     kb = []
     def btn_text(key):
@@ -104,18 +109,13 @@ def build_main_keyboard(user_id: Optional[int] = None) -> InlineKeyboardMarkup:
         cost_text = "бесплатно" if cost == 0 else f"{cost}⭐"
         return f"{prefix}🏀 {cnt} {noun} • {cost_text}", f"play_{key}"
 
-    # row1
     t, cb = btn_text("p6"); kb.append([InlineKeyboardButton(text=t, callback_data=cb)])
-    # row2
     t1, cb1 = btn_text("p5"); t2, cb2 = btn_text("p4")
     kb.append([InlineKeyboardButton(text=t1, callback_data=cb1), InlineKeyboardButton(text=t2, callback_data=cb2)])
-    # row3
     t1, cb1 = btn_text("p3"); t2, cb2 = btn_text("p2")
     kb.append([InlineKeyboardButton(text=t1, callback_data=cb1), InlineKeyboardButton(text=t2, callback_data=cb2)])
-    # row4
     t1, cb1 = btn_text("p1"); t2, cb2 = btn_text("prem1")
     kb.append([InlineKeyboardButton(text=t1, callback_data=cb1), InlineKeyboardButton(text=t2, callback_data=cb2)])
-    # row5
     kb.append([InlineKeyboardButton(text="+3⭐ за друга", callback_data="ref_menu")])
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
@@ -136,20 +136,15 @@ REPLY_MENU = ReplyKeyboardMarkup(
     one_time_keyboard=False
 )
 
-def build_ref_keyboard(user_id: int) -> InlineKeyboardMarkup:
-    # create share text with bot username (not id)
-    bot_username = ""
-    try:
-        me = asyncio.get_event_loop().run_until_complete(bot.get_me())
-        bot_username = me.username or ""
-    except Exception:
-        bot_username = ""
-    link = f"https://t.me/{bot_username}?start={user_id}" if bot_username else f"/start {user_id}"
+def build_ref_keyboard_with_link(user_id: int, bot_username: str) -> InlineKeyboardMarkup:
+    # build keyboard using actual bot_username (guarantees proper https link)
+    if bot_username:
+        link = f"https://t.me/{bot_username}?start={user_id}"
+    else:
+        link = f"/start {user_id}"
     share_text = f"🏀 Приглашаю тебя сыграть в баскет за подарки!\n{link}"
     share_url = f"https://t.me/share/url?text={urllib.parse.quote(share_text)}"
-    buttons = [
-        [InlineKeyboardButton(text="➡️ Отправить другу", url=share_url)],
-    ]
+    buttons = [[InlineKeyboardButton(text="➡️ Отправить другу", url=share_url)]]
     if PUBLIC_URL:
         copy_url = f"{PUBLIC_URL.rstrip('/')}/webapp/copy?link={urllib.parse.quote(link, safe='')}"
         buttons.append([InlineKeyboardButton(text="🔗 Скопировать ссылку", web_app=WebAppInfo(url=copy_url))])
@@ -267,14 +262,13 @@ async def set_user_virtual(user_id: int, value: int) -> int:
     return bot._mem_users[user_id]["virtual_stars"]
 
 async def get_user_free_next(user_id: int) -> int:
+    # ensure_user before reading to ensure row exists
+    await ensure_user(user_id)
     if db_pool:
         try:
             async with db_pool.acquire() as conn:
                 val = await conn.fetchval("SELECT free_next_at FROM users WHERE user_id=$1", user_id)
-                if val is None:
-                    await conn.execute("INSERT INTO users (user_id, free_next_at) VALUES ($1, 0) ON CONFLICT DO NOTHING", user_id)
-                    return 0
-                return int(val)
+                return int(val or 0)
         except Exception:
             log.exception("get_user_free_next DB failed")
     if not hasattr(bot, "_mem_users"):
@@ -606,7 +600,7 @@ async def cmd_start(message: types.Message):
             await bot.send_message(GROUP_ID, f"{mention} перешёл в бота", parse_mode=ParseMode.HTML)
     except Exception:
         pass
-    # payload (ref)
+    # handle payload (ref)
     payload = ""
     try:
         txt = (message.text or "").strip()
@@ -639,16 +633,16 @@ async def open_main_menu(message: types.Message):
 @dp.callback_query(lambda c: c.data == "ref_menu")
 async def ref_menu(call: types.CallbackQuery):
     uid = call.from_user.id
+    # fetch current bot username and build keyboard using it
     try:
-        # ensure bot username up-to-date in build_ref_keyboard
-        try:
-            me = await bot.get_me()
-            # regenerate keyboard using fresh username
-        except Exception:
-            pass
-        await call.message.edit_text(REF_TEXT_HTML, reply_markup=build_ref_keyboard(uid), parse_mode=ParseMode.HTML)
+        me = await bot.get_me()
+        bot_username = me.username or ""
     except Exception:
-        await call.message.answer(REF_TEXT_HTML, reply_markup=build_ref_keyboard(uid), parse_mode=ParseMode.HTML)
+        bot_username = ""
+    try:
+        await call.message.edit_text(REF_TEXT_HTML, reply_markup=build_ref_keyboard_with_link(uid, bot_username), parse_mode=ParseMode.HTML)
+    except Exception:
+        await call.message.answer(REF_TEXT_HTML, reply_markup=build_ref_keyboard_with_link(uid, bot_username), parse_mode=ParseMode.HTML)
 
 @dp.callback_query(lambda c: c.data and c.data.startswith("copy_ref_"))
 async def copy_ref_alert(call: types.CallbackQuery):
@@ -679,11 +673,14 @@ async def ref_back(call: types.CallbackQuery):
 @dp.callback_query(lambda c: c.data and c.data.startswith("play_"))
 async def play_callback(call: types.CallbackQuery):
     chat_id = call.message.chat.id
+    # ensure user row exists so cooldown works
+    user_id = call.from_user.id
+    await ensure_user(user_id)
+
     if game_locks.get(chat_id):
         await call.answer("Сначала дождитесь окончания текущей игры!", show_alert=False)
         return
     await call.answer()
-    user_id = call.from_user.id
     key = call.data.split("_", 1)[1]
     if key not in BUTTONS:
         await call.message.answer("Неизвестная кнопка.")
@@ -697,9 +694,8 @@ async def play_callback(call: types.CallbackQuery):
             rem = free_next - now
             mins = rem // 60
             secs = rem % 60
-            min_word = "минут" if mins != 1 else "минуту"
-            sec_word = "секунд" if secs != 1 else "секунду"
-            await call.answer(f"🏀 Вы сможете повторно сделать бесплатный бросок через {mins} {min_word} и {secs} {sec_word}", show_alert=False)
+            # show as notification (not message)
+            await call.answer(f"🏀 Вы сможете повторно сделать бесплатный бросок через {mins} минут и {secs} секунд", show_alert=False)
             return
         await set_user_free_next(user_id, now + FREE_COOLDOWN)
         await start_game_flow(chat_id, cnt, premium, user_id)
@@ -719,8 +715,8 @@ async def play_callback(call: types.CallbackQuery):
     label = f"Играть за {missing}⭐"
     amount = int(missing * STAR_UNIT_MULTIPLIER)
     prices = [LabeledPrice(label=label, amount=amount)]
-    # payload includes payer id, count, premium flag, timestamp to be unique
     ts = int(time.time())
+    # payload: buy_and_play:{payer_id}:{count}:{prem}:{ts}
     payload = f"buy_and_play:{user_id}:{cnt}:{1 if premium else 0}:{ts}"
     try:
         invoice_msg = await bot.send_invoice(
@@ -733,7 +729,6 @@ async def play_callback(call: types.CallbackQuery):
             payload=payload,
             start_parameter="buyandplay"
         )
-        # store invoice mapping so we can delete the invoice message after success
         try:
             invoice_map[payload] = (invoice_msg.chat.id, invoice_msg.message_id)
         except Exception:
@@ -754,13 +749,10 @@ async def on_successful_payment(message: types.Message):
     sp = message.successful_payment
     payload = getattr(sp, "invoice_payload", "") or ""
     payer_id = message.from_user.id
-    # payload expected: buy_and_play:{payer_id}:{count}:{prem}:{ts}
     if payload.startswith("buy_and_play:"):
         try:
             parts = payload.split(":")
-            # ['buy_and_play', payer_id_str, count_str, prem_str, ts]
             if len(parts) >= 4:
-                # payer_id from payload may be redundant, but we check
                 _payload_payer = int(parts[1]) if parts[1].isdigit() else payer_id
                 cnt = int(parts[2]) if parts[2].isdigit() else 1
                 prem_flag = int(parts[3]) if len(parts) >= 4 and parts[3].isdigit() else 0
@@ -770,7 +762,7 @@ async def on_successful_payment(message: types.Message):
         except Exception:
             cnt = 1
             prem_flag = 0
-        # delete invoice message if we stored it
+        # delete invoice message if stored
         try:
             mapping = invoice_map.pop(payload, None)
             if mapping:
@@ -789,15 +781,15 @@ async def on_successful_payment(message: types.Message):
         if paid_amount > 0:
             await change_bot_stars(paid_amount)
             await add_user_spent_real(payer_id, paid_amount)
-        # reset payer virtual balance to 0 (user paid)
+        # reset payer virtual balance to 0
         await set_user_virtual(payer_id, 0)
-        # start game in payer's private chat
+        # start the game in payer's private chat
         if game_locks.get(payer_id):
             await bot.send_message(payer_id, "Сейчас идёт другая игра в этом чате — ваша оплата зачислена, игра начнётся позже.")
             return
         await start_game_flow(payer_id, cnt, bool(prem_flag), payer_id)
         return
-    # fallback: other payload types handled if needed
+    # fallback: other payloads
     if payload.startswith("buy_virtual_"):
         try:
             parts = payload.split("_")
