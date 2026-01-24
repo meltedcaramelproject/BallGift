@@ -3,11 +3,12 @@ import asyncio
 import logging
 import os
 import time
+import random
 from typing import Optional
 
 import asyncpg
 from aiogram import Bot, Dispatcher, types, F
-from aiogram.enums import ParseMode, ChatType
+from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart
 from aiogram.client.default import DefaultBotProperties
 from aiogram.types import (
@@ -20,7 +21,7 @@ from aiohttp import web
 # LOGGING
 # --------------------
 logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("bot")
+log = logging.getLogger("ballbot")
 
 # --------------------
 # ENV
@@ -29,7 +30,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 GROUP_ID_RAW = os.getenv("GROUP_ID", "")
 PAYMENTS_PROVIDER_TOKEN = os.getenv("PAYMENTS_PROVIDER_TOKEN")  # optional
-ADMIN_ID = os.getenv("ADMIN_ID")  # optional — если хочешь ограничить /баланс <user> <amount>
+ADMIN_ID = os.getenv("ADMIN_ID")  # optional admin for sensitive ops
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
@@ -42,32 +43,35 @@ except Exception:
     GROUP_ID = None
 
 # --------------------
-# BOT & DP
+# BOT & DISPATCHER
 # --------------------
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
 # --------------------
-# DB
+# DB / STATE
 # --------------------
 db_pool: Optional[asyncpg.Pool] = None
-bot_balance: int = 0  # global bot balance (keeps track of sums from purchases / penalties)
+
+# Gift costs (real bot stars)
+GIFT_COSTS = {
+    "teddy": 5,   # cost in real stars
+    "heart": 3,
+}
 
 # --------------------
-# CONFIG / BUTTONS
+# UI / BUTTONS config
 # --------------------
-# (count, cost_in_stars)
 BUTTONS = [
-    (6, 0),   # бесплатный (cooldown 3 minutes)
+    (6, 0),   # free (cooldown)
     (5, 1),
     (4, 2),
-    (3, 4),   # updated price
-    (2, 6),   # updated price
+    (3, 4),
+    (2, 6),
     (1, 8),
 ]
 
 def word_form_mяч(count: int) -> str:
-    # 1..4 -> "мяча", 5..6 -> "мячей"
     return "мяча" if 1 <= count <= 4 else "мячей"
 
 def build_main_keyboard(user_id: Optional[int] = None) -> InlineKeyboardMarkup:
@@ -78,59 +82,66 @@ def build_main_keyboard(user_id: Optional[int] = None) -> InlineKeyboardMarkup:
         text = f"🏀 {count} {noun} • {cost_text}"
         cb = f"play_{count}_{cost}"
         kb.append([InlineKeyboardButton(text=text, callback_data=cb)])
-    # referral button renamed to "+3⭐ за друга"
     kb.append([InlineKeyboardButton(text="+3⭐ за друга", callback_data="ref_menu")])
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
 START_TEXT_TEMPLATE = (
     "<b>🏀 БАСКЕТБОЛ ЗА ПОДАРКИ 🏀</b>\n\n"
     "🎯 ПОПАДИ мячом в кольцо каждым броском — и получи КРУТОЙ ПОДАРОК 🎁\n\n"
-    "💰 Баланс: <b>{stars}</b>"
+    "💰 Баланс: <b>{virtual_stars}</b>"
 )
 
-REF_TEXT_TEMPLATE = (
+REF_TEXT_HTML = (
     "<b>+3⭐ ЗА ДРУГА</b>\n\n"
     "Получай +3⭐ на баланс за каждого приглашённого пользователя!"
 )
 
-# referral sub-menu keyboard
-def build_ref_keyboard(user_id: int) -> InlineKeyboardMarkup:
-    # share url for quick sharing
-    try:
-        me = asyncio.run_coroutine_threadsafe(bot.get_me(), asyncio.get_event_loop()).result(timeout=2)
-        bot_username = me.username or ""
-    except Exception:
-        bot_username = ""
-    link = f"https://t.me/{bot_username}?start={user_id}" if bot_username else f"/start {user_id}"
-    # share via t.me/share/url opens share dialog
-    share_url = f"https://t.me/share/url?url={link}&text=Приглашаю сыграть в баскет! {link}"
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➡️ Отправить другу", url=share_url)],
-        [InlineKeyboardButton(text="🔗 Скопировать ссылку", callback_data=f"copy_ref_{user_id}")],
-        [InlineKeyboardButton(text="◀️ Назад", callback_data="ref_back")]
-    ])
-    return kb
-
-# reply keyboard (left-bottom menu)
 REPLY_MENU = ReplyKeyboardMarkup(
     keyboard=[[KeyboardButton(text="🏀 Сыграть в баскет")]],
     resize_keyboard=True,
     one_time_keyboard=False
 )
 
+def build_ref_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    # create share url
+    bot_username = ""
+    try:
+        # try to get cached bot info; this is async, but acceptable here in handler
+        me = asyncio.get_event_loop().run_until_complete(bot.get_me())
+        bot_username = me.username or ""
+    except Exception:
+        bot_username = ""
+    link = f"https://t.me/{bot_username}?start={user_id}" if bot_username else f"/start {user_id}"
+    share_url = f"https://t.me/share/url?url={link}&text=Приглашаю сыграть в баскет! {link}"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➡️ Отправить другу", url=share_url)],
+        [InlineKeyboardButton(text="🔗 Скопировать ссылку", callback_data=f"copy_ref_{user_id}")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="ref_back")]
+    ])
+
+# Purchase keyboard for missing virtual stars (uses payments)
+def build_purchase_kb(missing: int, user_id: int) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(inline_keyboard=[])
+    if PAYMENTS_PROVIDER_TOKEN:
+        kb.inline_keyboard.append([InlineKeyboardButton(text=f"Оплатить {missing}⭐", callback_data=f"pay_virtual_{missing}")])
+    else:
+        kb.inline_keyboard.append([InlineKeyboardButton(text=f"🔗 Инструкция", callback_data=f"buyinfo_{missing}")])
+    kb.inline_keyboard.append([InlineKeyboardButton(text="◀️ Назад", callback_data="buy_back")])
+    return kb
+
 # --------------------
-# DB INIT
+# DB initialization
 # --------------------
 async def init_db():
-    global db_pool, bot_balance
+    global db_pool
     if not DATABASE_URL:
-        log.warning("DATABASE_URL not set — running without persistent DB (in-memory fallback)")
+        log.warning("DATABASE_URL not set — running with in-memory fallback")
+        db_pool = None
         return
-
     try:
-        db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=8, timeout=15)
+        db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=6, timeout=15)
         async with db_pool.acquire() as conn:
-            # tables:
+            # bot_stars = real stars on bot account
             await conn.execute("""
             CREATE TABLE IF NOT EXISTS bot_state (
                 key TEXT PRIMARY KEY,
@@ -140,8 +151,8 @@ async def init_db():
             await conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 user_id BIGINT PRIMARY KEY,
-                stars BIGINT NOT NULL DEFAULT 0,
-                free_next_at BIGINT NOT NULL DEFAULT 0  -- epoch seconds when free button becomes available
+                virtual_stars BIGINT NOT NULL DEFAULT 0,
+                free_next_at BIGINT NOT NULL DEFAULT 0
             );
             """)
             await conn.execute("""
@@ -152,83 +163,71 @@ async def init_db():
                 rewarded BOOLEAN NOT NULL DEFAULT FALSE
             );
             """)
-
-            row = await conn.fetchrow("SELECT value FROM bot_state WHERE key='balance'")
-            if row:
-                bot_balance = int(row["value"])
-            else:
-                await conn.execute("INSERT INTO bot_state (key, value) VALUES ('balance', 0) ON CONFLICT (key) DO NOTHING")
-                bot_balance = 0
-        log.info("✅ DB initialized")
+            # ensure bot_stars record exists
+            await conn.execute("INSERT INTO bot_state (key, value) VALUES ('bot_stars', 0) ON CONFLICT (key) DO NOTHING")
+        log.info("DB ready")
     except Exception:
-        log.exception("DB init failed, using in-memory fallback")
+        log.exception("DB init failed; falling back to in-memory")
         db_pool = None
 
 # --------------------
-# DB helpers: user operations
+# DB helpers: users, bot_stars, referrals
 # --------------------
-async def ensure_user_record(user_id: int):
-    """ Ensure users row exists; return (stars:int, free_next_at:int) """
+async def ensure_user(user_id: int):
     if db_pool:
         try:
             async with db_pool.acquire() as conn:
-                row = await conn.fetchrow("SELECT stars, free_next_at FROM users WHERE user_id=$1", user_id)
+                row = await conn.fetchrow("SELECT virtual_stars, free_next_at FROM users WHERE user_id=$1", user_id)
                 if row:
-                    return int(row["stars"]), int(row["free_next_at"])
-                await conn.execute("INSERT INTO users (user_id, stars, free_next_at) VALUES ($1, 0, 0) ON CONFLICT DO NOTHING", user_id)
+                    return int(row["virtual_stars"]), int(row["free_next_at"])
+                await conn.execute("INSERT INTO users (user_id, virtual_stars, free_next_at) VALUES ($1, 0, 0) ON CONFLICT DO NOTHING", user_id)
                 return 0, 0
         except Exception:
-            log.exception("ensure_user_record DB failed")
-            # fallback to in-memory
-    # in-memory fallback:
+            log.exception("ensure_user DB failed")
+    # in-memory fallback
     if not hasattr(bot, "_mem_users"):
         bot._mem_users = {}
-    rec = bot._mem_users.get(user_id, {"stars": 0, "free_next_at": 0})
-    bot._mem_users.setdefault(user_id, rec)
-    return rec["stars"], rec["free_next_at"]
+    rec = bot._mem_users.setdefault(user_id, {"virtual_stars": 0, "free_next_at": 0})
+    return rec["virtual_stars"], rec["free_next_at"]
 
-async def change_user_stars(user_id: int, delta: int) -> int:
-    """ Change user's stars by delta, return new stars (clamped >=0) """
+async def get_user_virtual(user_id: int) -> int:
+    vs, _ = await ensure_user(user_id)
+    return vs
+
+async def change_user_virtual(user_id: int, delta: int) -> int:
     if db_pool:
         try:
             async with db_pool.acquire() as conn:
-                row = await conn.fetchrow("UPDATE users SET stars = GREATEST(stars + $1, 0) WHERE user_id=$2 RETURNING stars", delta, user_id)
+                row = await conn.fetchrow("UPDATE users SET virtual_stars = GREATEST(virtual_stars + $1, 0) WHERE user_id=$2 RETURNING virtual_stars", delta, user_id)
                 if row:
-                    return int(row["stars"])
-                # if not exists - insert default then update
-                await conn.execute("INSERT INTO users (user_id, stars) VALUES ($1, 0) ON CONFLICT (user_id) DO NOTHING", user_id)
-                row2 = await conn.fetchrow("UPDATE users SET stars = GREATEST(stars + $1, 0) WHERE user_id=$2 RETURNING stars", delta, user_id)
-                return int(row2["stars"])
+                    return int(row["virtual_stars"])
+                await conn.execute("INSERT INTO users (user_id, virtual_stars) VALUES ($1, GREATEST($2,0)) ON CONFLICT (user_id) DO UPDATE SET virtual_stars = GREATEST(virtual_stars + $2, 0)", user_id, delta)
+                val = await conn.fetchval("SELECT virtual_stars FROM users WHERE user_id=$1", user_id)
+                return int(val or 0)
         except Exception:
-            log.exception("change_user_stars DB failed")
+            log.exception("change_user_virtual DB failed")
     # in-memory
     if not hasattr(bot, "_mem_users"):
         bot._mem_users = {}
-    rec = bot._mem_users.setdefault(user_id, {"stars": 0, "free_next_at": 0})
-    rec["stars"] = max(rec["stars"] + delta, 0)
-    return rec["stars"]
+    rec = bot._mem_users.setdefault(user_id, {"virtual_stars": 0, "free_next_at": 0})
+    rec["virtual_stars"] = max(rec["virtual_stars"] + delta, 0)
+    return rec["virtual_stars"]
 
-async def set_user_stars(user_id: int, value: int) -> int:
+async def set_user_virtual(user_id: int, value: int) -> int:
     if db_pool:
         try:
             async with db_pool.acquire() as conn:
-                await conn.execute("INSERT INTO users (user_id, stars, free_next_at) VALUES ($1, $2, 0) ON CONFLICT (user_id) DO UPDATE SET stars = $2", user_id, value)
-                row = await conn.fetchrow("SELECT stars FROM users WHERE user_id=$1", user_id)
-                return int(row["stars"])
+                await conn.execute("INSERT INTO users (user_id, virtual_stars, free_next_at) VALUES ($1, $2, 0) ON CONFLICT (user_id) DO UPDATE SET virtual_stars = $2", user_id, value)
+                return int(await conn.fetchval("SELECT virtual_stars FROM users WHERE user_id=$1", user_id))
         except Exception:
-            log.exception("set_user_stars DB failed")
+            log.exception("set_user_virtual DB failed")
     if not hasattr(bot, "_mem_users"):
         bot._mem_users = {}
-    rec = bot._mem_users.setdefault(user_id, {"stars": 0, "free_next_at": 0})
-    rec["stars"] = max(value, 0)
-    return rec["stars"]
-
-async def get_user_stars(user_id: int) -> int:
-    s, _ = await ensure_user_record(user_id)
-    return s
+    rec = bot._mem_users.setdefault(user_id, {"virtual_stars": 0, "free_next_at": 0})
+    rec["virtual_stars"] = max(value, 0)
+    return rec["virtual_stars"]
 
 async def get_user_free_next(user_id: int) -> int:
-    """return epoch seconds"""
     if db_pool:
         try:
             async with db_pool.acquire() as conn:
@@ -253,48 +252,66 @@ async def set_user_free_next(user_id: int, epoch_ts: int):
             log.exception("set_user_free_next DB failed")
     if not hasattr(bot, "_mem_users"):
         bot._mem_users = {}
-    rec = bot._mem_users.setdefault(user_id, {"stars": 0, "free_next_at": 0})
+    rec = bot._mem_users.setdefault(user_id, {"virtual_stars": 0, "free_next_at": 0})
     rec["free_next_at"] = epoch_ts
 
-# --------------------
-# Referrals
-# --------------------
-async def try_register_referral(referred_user: int, inviter: int) -> bool:
+# bot real stars
+async def get_bot_stars() -> int:
+    if db_pool:
+        try:
+            async with db_pool.acquire() as conn:
+                val = await conn.fetchval("SELECT value FROM bot_state WHERE key='bot_stars'")
+                return int(val or 0)
+        except Exception:
+            log.exception("get_bot_stars DB failed")
+    return getattr(bot, "_mem_bot_stars", 0)
+
+async def change_bot_stars(delta: int) -> int:
+    if db_pool:
+        try:
+            async with db_pool.acquire() as conn:
+                row = await conn.fetchrow("UPDATE bot_state SET value = GREATEST(value + $1, 0) WHERE key='bot_stars' RETURNING value", delta)
+                if row:
+                    return int(row["value"])
+                await conn.execute("INSERT INTO bot_state (key, value) VALUES ('bot_stars', GREATEST($1,0)) ON CONFLICT (key) DO UPDATE SET value = GREATEST(bot_state.value + $1, 0)", delta)
+                return int(await conn.fetchval("SELECT value FROM bot_state WHERE key='bot_stars'"))
+        except Exception:
+            log.exception("change_bot_stars DB failed")
+    cur = getattr(bot, "_mem_bot_stars", 0)
+    cur = max(cur + delta, 0)
+    bot._mem_bot_stars = cur
+    return cur
+
+# referrals
+async def register_ref_visit(referred_user: int, inviter: int) -> bool:
     """
-    Register referral entry if not exists.
-    Notify inviter that someone visited (but do not notify referred).
-    Return True if inserted, False if already existed.
+    Insert referral record if not exists. Notify inviter that someone visited.
+    Return True if inserted (new), False if already existed.
     """
     if db_pool:
         try:
             async with db_pool.acquire() as conn:
-                res = await conn.execute(
-                    "INSERT INTO referrals (referred_user, inviter, plays, rewarded) VALUES ($1, $2, 0, FALSE) ON CONFLICT (referred_user) DO NOTHING",
-                    referred_user, inviter
-                )
+                res = await conn.execute("INSERT INTO referrals (referred_user, inviter, plays, rewarded) VALUES ($1, $2, 0, FALSE) ON CONFLICT (referred_user) DO NOTHING", referred_user, inviter)
                 if res and res.endswith(" 1"):
-                    # notify inviter that their link was used (but per request, for the referred user DO NOT send them any message)
+                    # notify inviter (include clickable mention if possible)
                     try:
-                        # include username/link to referred user (clickable)
-                        txt = "🔗 По вашей ссылке перешёл "
-                        try:
-                            r = await bot.get_chat(referred_user)
-                            # show mention (if username) or name with tg link
-                            if r.username:
-                                mention = f"<a href=\"tg://user?id={referred_user}\">{r.username}</a>"
-                            else:
-                                name = (r.first_name or "") + (" " + r.last_name if getattr(r, "last_name", None) else "")
-                                mention = f"<a href=\"tg://user?id={referred_user}\">{name.strip()}</a>"
-                        except Exception:
-                            mention = f"<a href=\"tg://user?id={referred_user}\">user</a>"
-                        txt += f"{mention}\nВы получите <b>+3⭐</b> на баланс после того, как он сыграет 5 раз в баскетбол"
-                        await bot.send_message(inviter, txt, parse_mode=ParseMode.HTML)
+                        # attempt to get referred user's name
+                        r = await bot.get_chat(referred_user)
+                        if getattr(r, "username", None):
+                            mention = f"<a href=\"tg://user?id={referred_user}\">@{r.username}</a>"
+                        else:
+                            name = r.first_name or ""
+                            mention = f"<a href=\"tg://user?id={referred_user}\">{name}</a>"
                     except Exception:
-                        log.exception("Failed to notify inviter of referral visit")
+                        mention = f"<a href=\"tg://user?id={referred_user}\">user</a>"
+                    try:
+                        await bot.send_message(inviter, f"🔗 По вашей ссылке перешёл {mention}\nВы получите <b>+3⭐</b> на баланс после того, как он сыграет 5 раз в баскетбол", parse_mode=ParseMode.HTML)
+                    except Exception:
+                        log.exception("notify inviter failed")
                     return True
                 return False
         except Exception:
-            log.exception("try_register_referral DB failed")
+            log.exception("register_ref_visit DB failed")
             return False
     # in-memory
     if not hasattr(bot, "_mem_referrals"):
@@ -302,28 +319,20 @@ async def try_register_referral(referred_user: int, inviter: int) -> bool:
     if referred_user in bot._mem_referrals:
         return False
     bot._mem_referrals[referred_user] = {"inviter": inviter, "plays": 0, "rewarded": False}
-    # notify inviter
     try:
-        try:
-            r = await bot.get_chat(referred_user)
-            if r.username:
-                mention = f"@{r.username}"
-            else:
-                mention = r.first_name or "user"
-        except Exception:
-            mention = "user"
-        txt = f"🔗 По вашей ссылке перешёл {mention}\nВы получите <b>+3⭐</b> на баланс после того, как он сыграет 5 раз в баскетбол"
-        await bot.send_message(inviter, txt, parse_mode=ParseMode.HTML)
+        await bot.send_message(inviter, f"🔗 По вашей ссылке перешёл user\nВы получите <b>+3⭐</b> на баланс после того, как он сыграет 5 раз в баскетбол", parse_mode=ParseMode.HTML)
     except Exception:
-        log.exception("Failed to notify inviter in-memory")
+        log.exception("notify inviter in-memory failed")
     return True
 
-async def increment_referred_play_if_any(user_id: int):
-    """If user is a referred_user and not yet rewarded, increment plays count and reward inviter when reaches 5."""
+async def increment_referred_play(referred_user: int):
+    """
+    Increment plays count for referred_user, reward inviter +3 virtual stars when reach 5 plays.
+    """
     if db_pool:
         try:
             async with db_pool.acquire() as conn:
-                row = await conn.fetchrow("SELECT inviter, plays, rewarded FROM referrals WHERE referred_user=$1", user_id)
+                row = await conn.fetchrow("SELECT inviter, plays, rewarded FROM referrals WHERE referred_user=$1", referred_user)
                 if not row:
                     return
                 inviter, plays, rewarded = row["inviter"], row["plays"], row["rewarded"]
@@ -331,86 +340,47 @@ async def increment_referred_play_if_any(user_id: int):
                     return
                 plays += 1
                 if plays >= 5:
-                    # reward inviter +3 stars
-                    await conn.execute("UPDATE referrals SET plays=$1, rewarded=TRUE WHERE referred_user=$2", plays, user_id)
-                    await change_user_stars(inviter, 3)
+                    await conn.execute("UPDATE referrals SET plays=$1, rewarded=TRUE WHERE referred_user=$2", plays, referred_user)
+                    # give inviter +3 virtual stars
+                    await change_user_virtual(inviter, 3)
                     try:
                         await bot.send_message(inviter, "🔥 Вам начислено +3⭐ — приглашённый сыграл 5 раз!")
                     except Exception:
-                        log.exception("Failed to notify inviter about reward")
+                        log.exception("notify inviter reward failed")
                 else:
-                    await conn.execute("UPDATE referrals SET plays=$1 WHERE referred_user=$2", plays, user_id)
+                    await conn.execute("UPDATE referrals SET plays=$1 WHERE referred_user=$2", plays, referred_user)
         except Exception:
-            log.exception("increment_referred_play_if_any DB failed")
+            log.exception("increment_referred_play DB failed")
     else:
-        # in-memory
         mem = getattr(bot, "_mem_referrals", {})
-        rec = mem.get(user_id)
+        rec = mem.get(referred_user)
         if not rec or rec.get("rewarded"):
             return
         rec["plays"] = rec.get("plays", 0) + 1
         if rec["plays"] >= 5:
-            inviter = rec["inviter"]
             rec["rewarded"] = True
-            await change_user_stars(inviter, 3)
+            inviter = rec["inviter"]
+            await change_user_virtual(inviter, 3)
             try:
                 await bot.send_message(inviter, "🔥 Вам начислено +3⭐ — приглашённый сыграл 5 раз!")
             except Exception:
-                log.exception("Failed to notify inviter in-memory")
+                log.exception("notify inviter in-memory failed")
 
 # --------------------
-# Bot-wide balance change
-# --------------------
-async def change_bot_balance(delta: int):
-    global bot_balance, db_pool
-    if db_pool:
-        try:
-            async with db_pool.acquire() as conn:
-                row = await conn.fetchrow("UPDATE bot_state SET value = value + $1 WHERE key='balance' RETURNING value", delta)
-                if row:
-                    bot_balance = int(row["value"])
-                else:
-                    await conn.execute("INSERT INTO bot_state (key, value) VALUES ('balance', $1) ON CONFLICT (key) DO UPDATE SET value = bot_state.value + $1", delta)
-                    bot_balance = int(await conn.fetchval("SELECT value FROM bot_state WHERE key='balance'"))
-        except Exception:
-            log.exception("change_bot_balance failed")
-            bot_balance += delta
-    else:
-        bot_balance += delta
-    # optionally notify group only on major events (we'll notify on -15 penalties elsewhere)
-    return bot_balance
-
-# --------------------
-# Helper: build purchase keyboard for missing stars
-# --------------------
-def build_purchase_kb(missing: int, user_id: int):
-    # Buttons: pay (if provider token present) — otherwise show copy of a "manual purchase" link
-    kb = InlineKeyboardMarkup(inline_keyboard=[])
-    if PAYMENTS_PROVIDER_TOKEN:
-        # callback to initiate invoice generation
-        kb.inline_keyboard.append([InlineKeyboardButton(text=f"Оплатить {missing}⭐", callback_data=f"buystars_{missing}")])
-    else:
-        # fallback: show the referral copy / instruction via alert
-        kb.inline_keyboard.append([InlineKeyboardButton(text=f"🔗 Получить инструкцию", callback_data=f"buyinfo_{missing}")])
-    kb.inline_keyboard.append([InlineKeyboardButton(text="◀️ Назад", callback_data="buy_back")])
-    return kb
-
-# --------------------
-# START handler (with payload processing)
+# START handler (with payload processing for referral)
 # --------------------
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
     user = message.from_user
     user_id = user.id
-    # don't send "Добро пожаловать..." per request
-    # ensure user exists (creates user row)
-    await ensure_user_record(user_id)
+    # ensure record
+    await ensure_user(user_id)
 
-    # process payload (referral)
+    # parse payload
     payload = ""
     try:
-        text = (message.text or "").strip()
-        parts = text.split()
+        txt = (message.text or "").strip()
+        parts = txt.split()
         if len(parts) > 1:
             payload = parts[1]
     except Exception:
@@ -420,32 +390,31 @@ async def cmd_start(message: types.Message):
         try:
             inviter_id = int(payload)
             if inviter_id != user_id:
-                # register referral; referree should NOT be notified
-                await try_register_referral(user_id, inviter_id)
+                await register_ref_visit(user_id, inviter_id)
         except Exception:
             pass
 
-    # send reply-menu hint (neutral) and main inline menu showing user's stars
-    stars = await get_user_stars(user_id)
-    start_text = START_TEXT_TEMPLATE.format(stars=stars)
-    # reply hint (short)
+    # send reply hint and main message showing user's virtual stars
+    vstars = await get_user_virtual(user_id)
+    start_text = START_TEXT_TEMPLATE.format(virtual_stars=vstars)
+    # send reply menu hint (neutral)
     try:
         await message.answer("Меню внизу — откройте для быстрого доступа.", reply_markup=REPLY_MENU)
     except Exception:
-        log.exception("Failed to send reply hint")
+        pass
     try:
         await message.answer(start_text, reply_markup=build_main_keyboard(user_id))
     except Exception:
-        log.exception("Failed to send main menu on /start")
+        log.exception("send main menu failed on /start")
 
 # --------------------
-# Reply menu handler
+# Reply menu open
 # --------------------
 @dp.message(F.text == "🏀 Сыграть в баскет")
 async def open_main_menu_message(message: types.Message):
     user_id = message.from_user.id
-    stars = await get_user_stars(user_id)
-    start_text = START_TEXT_TEMPLATE.format(stars=stars)
+    vstars = await get_user_virtual(user_id)
+    start_text = START_TEXT_TEMPLATE.format(virtual_stars=vstars)
     await message.answer(start_text, reply_markup=build_main_keyboard(user_id))
 
 # --------------------
@@ -454,40 +423,38 @@ async def open_main_menu_message(message: types.Message):
 @dp.callback_query(lambda c: c.data == "ref_menu")
 async def ref_menu(call: types.CallbackQuery):
     user_id = call.from_user.id
-    # show new text + buttons as requested
     try:
-        await call.message.edit_text(REF_TEXT_TEMPLATE, reply_markup=build_ref_keyboard(user_id), parse_mode=ParseMode.HTML)
+        await call.message.edit_text(REF_TEXT_HTML, reply_markup=build_ref_keyboard(user_id), parse_mode=ParseMode.HTML)
     except Exception:
-        await call.message.answer(REF_TEXT_TEMPLATE, reply_markup=build_ref_keyboard(user_id), parse_mode=ParseMode.HTML)
-
-@dp.callback_query(lambda c: c.data == "ref_back")
-async def ref_back(call: types.CallbackQuery):
-    user_id = call.from_user.id
-    stars = await get_user_stars(user_id)
-    start_text = START_TEXT_TEMPLATE.format(stars=stars)
-    try:
-        await call.message.edit_text(start_text, reply_markup=build_main_keyboard(user_id), parse_mode=ParseMode.HTML)
-    except Exception:
-        await call.message.answer(start_text, reply_markup=build_main_keyboard(user_id), parse_mode=ParseMode.HTML)
+        await call.message.answer(REF_TEXT_HTML, reply_markup=build_ref_keyboard(user_id), parse_mode=ParseMode.HTML)
 
 @dp.callback_query(lambda c: c.data and c.data.startswith("copy_ref_"))
 async def copy_ref(call: types.CallbackQuery):
-    # show the link in an alert for user to copy (can't write to clipboard)
+    # show link in alert (user can copy manually)
     try:
-        user_id = int(call.data.split("_", 2)[2])
+        uid = int(call.data.split("_", 2)[2])
     except Exception:
-        user_id = call.from_user.id
+        uid = call.from_user.id
     try:
         me = await bot.get_me()
         bot_username = me.username or ""
     except Exception:
         bot_username = ""
-    link = f"https://t.me/{bot_username}?start={user_id}" if bot_username else f"/start {user_id}"
-    # show alert with link so user can copy
+    link = f"https://t.me/{bot_username}?start={uid}" if bot_username else f"/start {uid}"
     await call.answer(text=f"Ссылка: {link}", show_alert=True)
 
+@dp.callback_query(lambda c: c.data == "ref_back")
+async def ref_back(call: types.CallbackQuery):
+    user_id = call.from_user.id
+    vstars = await get_user_virtual(user_id)
+    start_text = START_TEXT_TEMPLATE.format(virtual_stars=vstars)
+    try:
+        await call.message.edit_text(start_text, reply_markup=build_main_keyboard(user_id), parse_mode=ParseMode.HTML)
+    except Exception:
+        await call.message.answer(start_text, reply_markup=build_main_keyboard(user_id))
+
 # --------------------
-# Play buttons handling
+# Play handler: play_{count}_{cost}
 # --------------------
 @dp.callback_query(lambda c: c.data and c.data.startswith("play_"))
 async def play_handler(call: types.CallbackQuery):
@@ -504,51 +471,43 @@ async def play_handler(call: types.CallbackQuery):
     except Exception:
         cost = 1
 
-    # guard
     if count < 1:
         count = 1
     if count > 20:
         count = 20
 
-    # If free (cost==0), check cooldown (3 minutes)
+    # free throw logic (cost == 0)
     if cost == 0:
         now_ts = int(time.time())
         free_next = await get_user_free_next(user_id)
         if now_ts < free_next:
-            # show notification (toast) with remaining time
             rem = free_next - now_ts
             mins = rem // 60
             secs = rem % 60
-            # localized strings per request
-            smin = "минут" if mins != 1 else "минуту"
-            ssec = "секунд" if secs != 1 else "секунду"
-            await call.answer(text=f"🏀 До следующего бесплатного броска осталось {mins} {smin} и {secs} {ssec}", show_alert=False)
+            min_word = "минут" if mins != 1 else "минуту"
+            sec_word = "секунд" if secs != 1 else "секунду"
+            await call.answer(text=f"🏀 До следующего бесплатного броска осталось {mins} {min_word} и {secs} {sec_word}", show_alert=False)
             return
-        # allow: set next available
+        # set next free time (3 minutes)
         await set_user_free_next(user_id, now_ts + 3 * 60)
-        # no extra message "Использован бесплатный..." per request
+        # free throw consumed silently
     else:
-        # check user stars
-        stars = await get_user_stars(user_id)
-        if stars < cost:
-            # show purchase menu for missing stars
-            missing = cost - stars
-            text = (
-                f"Получай крутой подарок за попадание 🏀 в кольцо\n\n"
-                f"Товары:\n"
-                f"{count} {word_form_mяч(count)} — цена: {missing}⭐ (недостающие звезды)"
-            )
+        # cost > 0: verify user has virtual stars
+        vstars = await get_user_virtual(user_id)
+        if vstars < cost:
+            # ask to purchase missing virtual stars
+            missing = cost - vstars
+            text = f"Получай крутой подарок за попадание 🏀 в кольцо\n\nТовар: {count} {word_form_mяч(count)} — требуется {missing}⭐"
             try:
                 await call.message.answer(text, reply_markup=build_purchase_kb(missing, user_id))
             except Exception:
                 await call.message.reply(text, reply_markup=build_purchase_kb(missing, user_id))
             return
-        # otherwise deduct cost from user's stars and proceed
-        new_stars = await change_user_stars(user_id, -cost)
-        # add cost to bot_balance
-        await change_bot_balance(cost)
+        # deduct user's virtual stars and credit bot_stars
+        new_v = await change_user_virtual(user_id, -cost)
+        await change_bot_stars(cost)
 
-    # send dice with 0.5s delay between sends
+    # send dice with 0.5s delay
     messages = []
     first_send_time = None
     for i in range(count):
@@ -562,40 +521,50 @@ async def play_handler(call: types.CallbackQuery):
         messages.append(msg)
         await asyncio.sleep(0.5)
 
-    # ensure at least 5 seconds after first send
+    # wait until 5s since first send
     if first_send_time is None:
         first_send_time = time.monotonic()
     elapsed = time.monotonic() - first_send_time
-    wait_for = 5.0 - elapsed
-    if wait_for > 0:
-        await asyncio.sleep(wait_for)
+    if elapsed < 5.0:
+        await asyncio.sleep(5.0 - elapsed)
 
     # collect results
     hits = 0
     results = []
     for msg in messages:
-        val = getattr(msg, "dice", None)
-        value = getattr(val, "value", 0) if val else 0
+        value = getattr(msg.dice, "value", 0) if getattr(msg, "dice", None) else 0
         results.append(int(value))
         if int(value) >= 4:
             hits += 1
 
     sent_count = len(results)
 
-    # increment referral play count for this user (if referred)
+    # increment referral counter if applicable
     if sent_count > 0:
-        await increment_referred_play_if_any(user_id)
+        await increment_referred_play(user_id)
 
-    # if all sent hits -> penalty -15 to bot and notify group
+    # if user wins (all hits), bot gives a gift taken from bot_stars
     if sent_count > 0 and hits == sent_count:
-        new_bot_bal = await change_bot_balance(-15)
-        if GROUP_ID:
+        # choose gift randomly
+        gift = random.choice(["teddy", "heart"])
+        cost_g = GIFT_COSTS.get(gift, 3)
+        bot_stars_now = await get_bot_stars()
+        if bot_stars_now < cost_g:
+            # insufficient bot stars
             try:
-                await bot.send_message(GROUP_ID, f"⚠️ Произведено списание: <b>-15</b>\n💰 Текущий баланс бота: <b>{new_bot_bal}</b>")
+                await bot.send_message(call.message.chat.id, "⚠️ У бота недостаточно звёзд для покупки подарка.")
             except Exception:
-                log.exception("Failed to notify group about -15")
+                pass
+        else:
+            # deduct bot stars and "send" gift (text)
+            await change_bot_stars(-cost_g)
+            gift_text = "🎁 Вы выиграли: " + ("🐻 Мишка" if gift == "teddy" else "💖 Сердечко")
+            try:
+                await bot.send_message(call.message.chat.id, gift_text)
+            except Exception:
+                log.exception("send gift message failed")
 
-    # send results (only "Попал"/"Промах", no numbering)
+    # send results summary (only Попал/Промах)
     text_lines = ["🎯 <b>Результаты бросков:</b>\n"]
     if results:
         for v in results:
@@ -608,165 +577,147 @@ async def play_handler(call: types.CallbackQuery):
     await bot.send_message(call.message.chat.id, "✅ ПОПАДАНИЕ!" if sent_count > 0 and hits == sent_count else "🟡 Не все попали. Попробуем ещё?")
 
     await asyncio.sleep(1)
-    # send updated main menu with current user's stars
-    stars_now = await get_user_stars(user_id)
-    start_text = START_TEXT_TEMPLATE.format(stars=stars_now)
+    # send updated main menu with user's virtual stars displayed
+    v_now = await get_user_virtual(user_id)
+    start_text = START_TEXT_TEMPLATE.format(virtual_stars=v_now)
     await bot.send_message(call.message.chat.id, start_text, reply_markup=build_main_keyboard(user_id))
 
 # --------------------
-# Callbacks for purchase flow
+# Purchase flow: create invoice for missing virtual stars
 # --------------------
-@dp.callback_query(lambda c: c.data and c.data.startswith("buystars_"))
-async def buystars_callback(call: types.CallbackQuery):
-    # data: buystars_<missing>
+@dp.callback_query(lambda c: c.data and c.data.startswith("pay_virtual_"))
+async def pay_virtual_cb(call: types.CallbackQuery):
     await call.answer()
     if not PAYMENTS_PROVIDER_TOKEN:
-        await call.message.answer("Платёжный провайдер не настроен (PAYMENTS_PROVIDER_TOKEN отсутствует).")
+        await call.message.answer("Платёжный провайдер не настроен.")
         return
     try:
-        missing = int(call.data.split("_", 1)[1])
+        missing = int(call.data.split("_", 2)[2])
     except Exception:
-        await call.message.answer("Неверные данные покупки.")
+        await call.message.answer("Ошибка данных покупки.")
         return
     user = call.from_user
-    # create invoice: title, description, prices in smallest currency units
-    # NOTE: this uses Telegram Payments — you must configure PAYMENT_TOKEN in ENV and bot must be enabled by provider
-    title = f"Покупка {missing}⭐"
-    description = f"Покупка {missing} звёзд для игры"
-    # For demo: price in cents. You must change currency/prices according to your provider.
-    amount_per_star_cents = 100  # example: 1 star = 1.00 (currency) -> 100 cents
-    total_cents = missing * amount_per_star_cents
-    prices = [LabeledPrice(label=f"{missing}⭐", amount=total_cents)]
-    try:
-        await bot.send_invoice(
-            chat_id=user.id,
-            title=title,
-            description=description,
-            payload=f"buy_{user.id}_{missing}_{int(time.time())}",
-            provider_token=PAYMENTS_PROVIDER_TOKEN,
-            currency="USD",  # change to provider currency
-            prices=prices,
-            start_parameter="buystars"
-        )
-    except Exception:
-        log.exception("send_invoice failed")
-        await call.message.answer("Не удалось создать платёж. Проверьте PAYMENTS_PROVIDER_TOKEN и настройки платёжей.")
+    # Example pricing: 1 star = 1.00 USD -> 100 cents. Adapt to your provider/currency.
+    amount_cents = missing * 100  # e.g., $1 per star
+    prices = [LabeledPrice(label=f"{missing}⭐", amount=amount_cents)]
+    await bot.send_invoice(
+        chat_id=user.id,
+        title=f"Покупка {missing}⭐",
+        description=f"Покупка {missing} виртуальных звёзд для игры",
+        provider_token=PAYMENTS_PROVIDER_TOKEN,
+        currency="USD",  # change if needed
+        prices=prices,
+        payload=f"buy_virtual_{user.id}_{missing}_{int(time.time())}",
+        start_parameter="buystars"
+    )
 
+# accept precheckout
 @dp.pre_checkout_query()
-async def on_precheckout(pre_q: types.PreCheckoutQuery):
-    # always accept for now
+async def preq_handler(pre_q: types.PreCheckoutQuery):
     await bot.answer_pre_checkout_query(pre_q.id, ok=True)
 
-@dp.message(types.ContentTypes.SUCCESSFUL_PAYMENT)
+# successful payment handler
+@dp.message(F.successful_payment)
 async def on_successful_payment(message: types.Message):
-    # After successful payment, extract payload if available and credit stars
+    pay = message.successful_payment
+    # payload format used: buy_virtual_<user>_<stars>_<ts>
+    payload = getattr(pay, "invoice_payload", "") or ""
     try:
-        pay = message.successful_payment
-        payload = pay.invoice_payload  # our payload
-        # payload format: buy_<user_id>_<missing>_<ts>
         parts = payload.split("_")
-        if len(parts) >= 3 and parts[0] == "buy":
-            target_user = int(parts[1])
-            missing = int(parts[2])
-            # credit user with missing stars
-            new_val = await change_user_stars(target_user, missing)
-            await message.answer(f"Оплата прошла успешно. Вам начислено {missing}⭐. Текущий баланс: {new_val}⭐")
-            # optionally send the balls immediately: emulate pressing that play (we'll not auto-send balls — safer to let user click)
+        if len(parts) >= 3 and parts[0] == "buy" and parts[1] == "virtual":
+            # older variants? fallback
+            pass
+    except Exception:
+        pass
+    # our payload format used above: "buy_virtual_<user>_<missing>_<ts>"
+    try:
+        payload = pay.invoice_payload or ""
+        if payload.startswith("buy_virtual_"):
+            _, _, uid_str, missing_str, *_ = payload.split("_")
+            target_user = int(uid_str)
+            missing = int(missing_str)
+            # credit user's virtual stars and also increase bot_stars by same (user paid real money -> bot got real stars)
+            await change_user_virtual(target_user, missing)
+            await change_bot_stars(missing)
+            await bot.send_message(target_user, f"Оплата принята — вам начислено {missing}⭐. Удачи в игре!")
         else:
+            # unknown payload, just ack
             await message.answer("Платёж принят. Спасибо!")
     except Exception:
         log.exception("on_successful_payment failed")
+        await message.answer("Платёж принят (ошибка обработки payload).")
 
 @dp.callback_query(lambda c: c.data and c.data.startswith("buyinfo_"))
-async def buyinfo_callback(call: types.CallbackQuery):
-    # show info in alert with instructions how to pay externally
-    await call.answer(text="Платёжный провайдер не настроен. Свяжитесь с админом для покупки.", show_alert=True)
+async def buyinfo_cb(call: types.CallbackQuery):
+    await call.answer(text="Платёжный провайдер не настроен. Свяжитесь с админом.", show_alert=True)
 
 @dp.callback_query(lambda c: c.data == "buy_back")
-async def buy_back(call: types.CallbackQuery):
+async def buy_back_cb(call: types.CallbackQuery):
     user_id = call.from_user.id
-    stars = await get_user_stars(user_id)
-    start_text = START_TEXT_TEMPLATE.format(stars=stars)
+    v = await get_user_virtual(user_id)
+    text = START_TEXT_TEMPLATE.format(virtual_stars=v)
     try:
-        await call.message.edit_text(start_text, reply_markup=build_main_keyboard(user_id), parse_mode=ParseMode.HTML)
+        await call.message.edit_text(text, reply_markup=build_main_keyboard(user_id), parse_mode=ParseMode.HTML)
     except Exception:
-        await call.message.answer(start_text, reply_markup=build_main_keyboard(user_id), parse_mode=ParseMode.HTML)
+        await call.message.answer(text, reply_markup=build_main_keyboard(user_id), parse_mode=ParseMode.HTML)
 
 # --------------------
-# Command "баланс" — show or set other user's stars
-# Format variants:
-# - "баланс" -> show own
-# - "баланс <user>" -> show that user (id or @username)
-# - "баланс <user> <amount>" -> set that user's stars to amount (if ADMIN_ID set only admin can)
+# Command "баланс" — only in GROUP_ID
+# - "баланс" -> show bot's real stars (bot_stars) (only in group)
+# - "баланс <user> <num>" -> set virtual stars for user to num (only in group)
 # --------------------
 @dp.message()
-async def balance_commands(message: types.Message):
+async def balans_cmd(message: types.Message):
     text = (message.text or "").strip()
     if not text:
         return
     lowered = text.lower()
     if not (lowered.startswith("/баланс") or lowered.split()[0] == "баланс"):
         return
+    # Only allow in the specific group
+    if GROUP_ID is None or message.chat.id != GROUP_ID:
+        # ignore elsewhere
+        return
     parts = text.split()
-    # helper to resolve user identifier to id
-    async def resolve_user_identifier(token: str) -> Optional[int]:
-        # numeric?
-        if token.lstrip("-").isdigit():
-            return int(token)
-        # @username?
-        if token.startswith("@"):
-            try:
-                chat = await bot.get_chat(token)
-                return chat.id
-            except Exception:
-                return None
-        # try as plain username
-        try:
-            chat = await bot.get_chat(token)
-            return chat.id
-        except Exception:
-            return None
-
-    # three cases
     if len(parts) == 1:
-        # show own stars
-        user_id = message.from_user.id
-        stars = await get_user_stars(user_id)
-        await message.answer(f"💰 Ваш баланс: <b>{stars}⭐</b>")
+        # show bot's real stars
+        bstars = await get_bot_stars()
+        await message.answer(f"💰 Баланс бота (реальные звёзды): <b>{bstars}</b>")
         return
-
-    # at least 2 parts
-    target_token = parts[1]
-    target_id = await resolve_user_identifier(target_token)
-    if target_id is None:
-        await message.answer("Не удалось найти указанного пользователя.")
-        return
-
-    if len(parts) == 2:
-        # show target's balance
-        stars = await get_user_stars(target_id)
-        await message.answer(f"💰 Баланс пользователя: <b>{stars}⭐</b>")
-        return
-
-    # len >=3 -> set value
-    # optional admin check
-    if ADMIN_ID:
-        try:
-            if str(message.from_user.id) != str(ADMIN_ID):
-                await message.answer("У вас нет прав для установки баланса другому пользователю.")
+    # if len >=3 and second is user and third is number -> set user's virtual stars
+    if len(parts) >= 3:
+        user_token = parts[1]
+        amount_token = parts[2]
+        # resolve user id
+        target_id = None
+        if user_token.lstrip("-").isdigit():
+            target_id = int(user_token)
+        elif user_token.startswith("@"):
+            try:
+                chat = await bot.get_chat(user_token)
+                target_id = chat.id
+            except Exception:
+                await message.answer("Не удалось найти пользователя по имени.")
                 return
-        except Exception:
-            pass
-
-    if len(parts) >= 3 and parts[2].lstrip("-").isdigit():
-        amount = int(parts[2])
-        newv = await set_user_stars(target_id, amount)
-        await message.answer(f"💰 Баланс пользователя {target_id} установлен: <b>{newv}⭐</b>")
-    else:
-        await message.answer("Неверный формат. Используй: баланс <user> <amount>")
+        else:
+            try:
+                chat = await bot.get_chat(user_token)
+                target_id = chat.id
+            except Exception:
+                await message.answer("Не удалось найти пользователя.")
+                return
+        if not amount_token.lstrip("-").isdigit():
+            await message.answer("Неверное число.")
+            return
+        amount = int(amount_token)
+        await set_user_virtual(target_id, amount)
+        await message.answer(f"Баланс пользователя {target_id} установлен: <b>{amount}⭐</b>")
+        return
+    # fallback: show usage
+    await message.answer("Использование: баланс OR баланс <user> <amount> (только в группе)")
 
 # --------------------
-# HEALTH endpoint for Render
+# Health endpoint for Render
 # --------------------
 async def handle_health(request):
     return web.Response(text="OK")
@@ -779,15 +730,15 @@ async def start_web():
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    log.info(f"Web server started on port {port}")
+    log.info(f"Web server running on port {port}")
 
 # --------------------
 # MAIN
 # --------------------
 async def main():
-    log.info("BOT starting")
+    log.info("Starting bot")
     await init_db()
-    # warm bot username
+    # warm bot info
     try:
         await bot.get_me()
     except Exception:
