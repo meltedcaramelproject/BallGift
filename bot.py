@@ -55,15 +55,18 @@ db_pool: Optional[asyncpg.Pool] = None
 # per-chat lock for running games (to prevent concurrent games in same chat)
 game_locks: dict[int, bool] = {}
 
-# Config for buttons: (key, count, virtual_cost, label_prefix, premium_flag)
+# invoice mapping: payload -> (chat_id, message_id) to delete invoice after success
+invoice_map: dict[str, Tuple[int, int]] = {}
+
+# Config for buttons: (count, virtual_cost, premium_flag, prefix)
 BUTTONS = {
     "p6": (6, 0, False, ""),
     "p5": (5, 1, False, ""),
     "p4": (4, 2, False, ""),
     "p3": (3, 4, False, ""),
     "p2": (2, 6, False, ""),
-    "p1": (1, 10, False, ""),
-    "prem1": (1, 15, True, "💎")
+    "p1": (1, 10, False, ""),   # single ball 10⭐
+    "prem1": (1, 15, True, "💎") # premium single ball 15⭐
 }
 
 # Gift real-star costs and premium gifts
@@ -75,6 +78,9 @@ STAR_UNIT_MULTIPLIER = 1
 
 # Free cooldown seconds
 FREE_COOLDOWN = 3 * 60  # 3 minutes
+
+# Minimal wait after first throw before showing results (requirement changed to 7s)
+MIN_WAIT_FROM_FIRST_THROW = 7.0
 
 # --------------------
 # UI Helpers
@@ -93,10 +99,9 @@ def build_main_keyboard(user_id: Optional[int] = None) -> InlineKeyboardMarkup:
     """
     kb = []
     def btn_text(key):
-        cnt, cost, prem, prefix = (BUTTONS[key][0], BUTTONS[key][1], BUTTONS[key][2], BUTTONS[key][3])
+        cnt, cost, prem, prefix = BUTTONS[key]
         noun = word_form_mяч(cnt)
         cost_text = "бесплатно" if cost == 0 else f"{cost}⭐"
-        prefix = BUTTONS[key][3]
         return f"{prefix}🏀 {cnt} {noun} • {cost_text}", f"play_{key}"
 
     # row1
@@ -132,22 +137,19 @@ REPLY_MENU = ReplyKeyboardMarkup(
 )
 
 def build_ref_keyboard(user_id: int) -> InlineKeyboardMarkup:
-    # share link button (opens share chooser)
-    me_username = ""
+    # create share text with bot username (not id)
+    bot_username = ""
     try:
-        # best-effort get bot username
         me = asyncio.get_event_loop().run_until_complete(bot.get_me())
-        me_username = me.username or ""
+        bot_username = me.username or ""
     except Exception:
-        me_username = ""
-    link = f"https://t.me/{me_username}?start={user_id}" if me_username else f"/start {user_id}"
-    # message text for sharing
+        bot_username = ""
+    link = f"https://t.me/{bot_username}?start={user_id}" if bot_username else f"/start {user_id}"
     share_text = f"🏀 Приглашаю тебя сыграть в баскет за подарки!\n{link}"
     share_url = f"https://t.me/share/url?text={urllib.parse.quote(share_text)}"
     buttons = [
         [InlineKeyboardButton(text="➡️ Отправить другу", url=share_url)],
     ]
-    # copy button: if PUBLIC_URL set, open WebApp which auto copies link then closes; else fallback to alert
     if PUBLIC_URL:
         copy_url = f"{PUBLIC_URL.rstrip('/')}/webapp/copy?link={urllib.parse.quote(link, safe='')}"
         buttons.append([InlineKeyboardButton(text="🔗 Скопировать ссылку", web_app=WebAppInfo(url=copy_url))])
@@ -168,7 +170,6 @@ async def init_db():
     try:
         db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=8, timeout=15)
         async with db_pool.acquire() as conn:
-            # users: per-user virtual stars, cooldown, spent/earned real stars, plays_total
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS users (
                     user_id BIGINT PRIMARY KEY,
@@ -179,7 +180,6 @@ async def init_db():
                     plays_total BIGINT NOT NULL DEFAULT 0
                 )
             """)
-            # referrals
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS referrals (
                     referred_user BIGINT PRIMARY KEY,
@@ -188,14 +188,12 @@ async def init_db():
                     rewarded BOOLEAN NOT NULL DEFAULT FALSE
                 )
             """)
-            # bot_state: stores bot_stars
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS bot_state (
                     key TEXT PRIMARY KEY,
                     value BIGINT NOT NULL
                 )
             """)
-            # stats
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS stats (
                     count INT NOT NULL,
@@ -205,11 +203,9 @@ async def init_db():
                     PRIMARY KEY(count, premium)
                 )
             """)
-            # ensure bot_stars row exists
             await conn.execute("INSERT INTO bot_state (key, value) VALUES ('bot_stars', 0) ON CONFLICT (key) DO NOTHING")
-            # ensure stats rows exist
             for c, prem in [(1, False), (2, False), (3, False), (4, False), (5, False), (6, False), (1, True)]:
-                await conn.execute("INSERT INTO stats (count, premium, wins, losses) VALUES ($1, $2, 0, 0) ON CONFLICT (count, premium) DO NOTHING", c, prem)
+                await conn.execute("INSERT INTO stats (count, premium, wins, losses) VALUES ($1,$2,0,0) ON CONFLICT (count,premium) DO NOTHING", c, prem)
         log.info("DB initialized")
     except Exception:
         log.exception("DB init failed — falling back to in-memory")
@@ -229,7 +225,6 @@ async def ensure_user(user_id: int) -> Tuple[int, int]:
                 return 0, 0
         except Exception:
             log.exception("ensure_user DB failed")
-    # fallback
     if not hasattr(bot, "_mem_users"):
         bot._mem_users = {}
     rec = bot._mem_users.setdefault(user_id, {"virtual_stars": 0, "free_next_at": 0, "spent_real": 0, "earned_real": 0, "plays_total": 0})
@@ -243,19 +238,14 @@ async def change_user_virtual(user_id: int, delta: int) -> int:
     if db_pool:
         try:
             async with db_pool.acquire() as conn:
-                row = await conn.fetchrow(
-                    "UPDATE users SET virtual_stars = GREATEST(virtual_stars + $1, 0) WHERE user_id=$2 RETURNING virtual_stars",
-                    delta, user_id
-                )
+                row = await conn.fetchrow("UPDATE users SET virtual_stars = GREATEST(virtual_stars + $1, 0) WHERE user_id=$2 RETURNING virtual_stars", delta, user_id)
                 if row:
                     return int(row["virtual_stars"])
-                # insert if missing
                 await conn.execute("INSERT INTO users (user_id, virtual_stars) VALUES ($1, GREATEST($2,0)) ON CONFLICT (user_id) DO UPDATE SET virtual_stars = GREATEST(users.virtual_stars + $2, 0)", user_id, delta)
                 val = await conn.fetchval("SELECT virtual_stars FROM users WHERE user_id=$1", user_id)
                 return int(val or 0)
         except Exception:
             log.exception("change_user_virtual DB failed")
-    # fallback in-memory
     if not hasattr(bot, "_mem_users"):
         bot._mem_users = {}
     rec = bot._mem_users.setdefault(user_id, {"virtual_stars": 0, "free_next_at": 0, "spent_real": 0, "earned_real": 0, "plays_total": 0})
@@ -375,7 +365,6 @@ async def register_ref_visit(referred_user: int, inviter: int) -> bool:
             async with db_pool.acquire() as conn:
                 res = await conn.execute("INSERT INTO referrals (referred_user, inviter, plays, rewarded) VALUES ($1, $2, 0, FALSE) ON CONFLICT (referred_user) DO NOTHING", referred_user, inviter)
                 if res and res.endswith(" 1"):
-                    # notify inviter
                     try:
                         u = await bot.get_chat(referred_user)
                         mention = f"@{u.username}" if getattr(u, "username", None) else (u.first_name or str(referred_user))
@@ -503,7 +492,6 @@ async def get_stats_summary() -> str:
                 return "\n".join(lines)
         except Exception:
             log.exception("get_stats DB failed")
-    # fallback
     users_count = len(getattr(bot, "_mem_users", {}))
     botstars = getattr(bot, "_mem_bot_stars", 0)
     lines.append(f"Пользователей в боте: {users_count}")
@@ -513,7 +501,7 @@ async def get_stats_summary() -> str:
     return "\n".join(lines)
 
 # --------------------
-# Game flow
+# Game flow (uses MIN_WAIT_FROM_FIRST_THROW)
 # --------------------
 async def start_game_flow(chat_id: int, count: int, premium: bool, user_id: int):
     if game_locks.get(chat_id):
@@ -535,8 +523,8 @@ async def start_game_flow(chat_id: int, count: int, premium: bool, user_id: int)
         if first_send_time is None:
             first_send_time = time.monotonic()
         elapsed = time.monotonic() - first_send_time
-        if elapsed < 5.0:
-            await asyncio.sleep(5.0 - elapsed)
+        if elapsed < MIN_WAIT_FROM_FIRST_THROW:
+            await asyncio.sleep(MIN_WAIT_FROM_FIRST_THROW - elapsed)
         hits = 0
         results = []
         for msg in messages:
@@ -612,14 +600,13 @@ async def cmd_start(message: types.Message):
     user = message.from_user
     uid = user.id
     await ensure_user(uid)
-    # notify group user joined
     try:
         mention = f"<a href=\"tg://user?id={uid}\">{user.first_name or uid}</a>"
         if GROUP_ID:
             await bot.send_message(GROUP_ID, f"{mention} перешёл в бота", parse_mode=ParseMode.HTML)
     except Exception:
         pass
-    # handle payload (ref)
+    # payload (ref)
     payload = ""
     try:
         txt = (message.text or "").strip()
@@ -653,6 +640,12 @@ async def open_main_menu(message: types.Message):
 async def ref_menu(call: types.CallbackQuery):
     uid = call.from_user.id
     try:
+        # ensure bot username up-to-date in build_ref_keyboard
+        try:
+            me = await bot.get_me()
+            # regenerate keyboard using fresh username
+        except Exception:
+            pass
         await call.message.edit_text(REF_TEXT_HTML, reply_markup=build_ref_keyboard(uid), parse_mode=ParseMode.HTML)
     except Exception:
         await call.message.answer(REF_TEXT_HTML, reply_markup=build_ref_keyboard(uid), parse_mode=ParseMode.HTML)
@@ -681,7 +674,7 @@ async def ref_back(call: types.CallbackQuery):
         await call.message.answer(START_TEXT_TEMPLATE.format(virtual_stars=v), reply_markup=build_main_keyboard(uid), parse_mode=ParseMode.HTML)
 
 # --------------------
-# Play handling
+# Play handling (sends invoice and stores mapping)
 # --------------------
 @dp.callback_query(lambda c: c.data and c.data.startswith("play_"))
 async def play_callback(call: types.CallbackQuery):
@@ -696,7 +689,7 @@ async def play_callback(call: types.CallbackQuery):
         await call.message.answer("Неизвестная кнопка.")
         return
     cnt, cost, premium, prefix = BUTTONS[key]
-    # free button logic
+    # free
     if cost == 0:
         now = int(time.time())
         free_next = await get_user_free_next(user_id)
@@ -711,7 +704,7 @@ async def play_callback(call: types.CallbackQuery):
         await set_user_free_next(user_id, now + FREE_COOLDOWN)
         await start_game_flow(chat_id, cnt, premium, user_id)
         return
-    # paid flow
+    # paid
     vstars = await get_user_virtual(user_id)
     if vstars >= cost:
         await change_user_virtual(user_id, -cost)
@@ -726,10 +719,11 @@ async def play_callback(call: types.CallbackQuery):
     label = f"Играть за {missing}⭐"
     amount = int(missing * STAR_UNIT_MULTIPLIER)
     prices = [LabeledPrice(label=label, amount=amount)]
-    # payload includes count and premium flag
-    payload = f"buy_and_play:{cnt}:{1 if premium else 0}"
+    # payload includes payer id, count, premium flag, timestamp to be unique
+    ts = int(time.time())
+    payload = f"buy_and_play:{user_id}:{cnt}:{1 if premium else 0}:{ts}"
     try:
-        await bot.send_invoice(
+        invoice_msg = await bot.send_invoice(
             chat_id=user_id,
             title=title,
             description=description,
@@ -739,12 +733,17 @@ async def play_callback(call: types.CallbackQuery):
             payload=payload,
             start_parameter="buyandplay"
         )
+        # store invoice mapping so we can delete the invoice message after success
+        try:
+            invoice_map[payload] = (invoice_msg.chat.id, invoice_msg.message_id)
+        except Exception:
+            log.exception("Failed to store invoice mapping")
     except Exception:
         log.exception("send_invoice failed")
         await call.message.answer("Не удалось создать платёж. Проверьте Payments в BotFather.")
 
 # --------------------
-# Payment handlers
+# Payment handlers (delete invoice message on success, credit bot_stars, start game)
 # --------------------
 @dp.pre_checkout_query()
 async def precheckout_handler(pre_q: PreCheckoutQuery):
@@ -755,42 +754,53 @@ async def on_successful_payment(message: types.Message):
     sp = message.successful_payment
     payload = getattr(sp, "invoice_payload", "") or ""
     payer_id = message.from_user.id
-    # payload pattern: buy_and_play:{count}:{premium_flag} or buy_virtual...
-    if payload.startswith("buy_and_play:") or payload.startswith("buy_and_play"):
+    # payload expected: buy_and_play:{payer_id}:{count}:{prem}:{ts}
+    if payload.startswith("buy_and_play:"):
         try:
-            # support both colon and underscore variants
-            parts = payload.replace("buy_and_play_", "buy_and_play:").split(":")
-            # parts = ['buy_and_play', '{count}', '{premium_flag}', ...]
-            if len(parts) >= 3:
-                cnt = int(parts[1])
-                prem_flag = int(parts[2]) if len(parts) >= 3 else 0
+            parts = payload.split(":")
+            # ['buy_and_play', payer_id_str, count_str, prem_str, ts]
+            if len(parts) >= 4:
+                # payer_id from payload may be redundant, but we check
+                _payload_payer = int(parts[1]) if parts[1].isdigit() else payer_id
+                cnt = int(parts[2]) if parts[2].isdigit() else 1
+                prem_flag = int(parts[3]) if len(parts) >= 4 and parts[3].isdigit() else 0
             else:
-                # fallback: if payload included missing stars as amount, try parse differently
                 cnt = 1
                 prem_flag = 0
         except Exception:
             cnt = 1
             prem_flag = 0
-        # amount paid in successful_payment: use total_amount (in smallest units) if present
-        # For currency XTR we used amount equal to number of stars; get it from successful_payment.total_amount if available
+        # delete invoice message if we stored it
+        try:
+            mapping = invoice_map.pop(payload, None)
+            if mapping:
+                inv_chat_id, inv_msg_id = mapping
+                try:
+                    await bot.delete_message(inv_chat_id, inv_msg_id)
+                except Exception:
+                    log.exception("Failed to delete invoice message")
+        except Exception:
+            log.exception("invoice_map delete error")
+        # amount paid (total_amount) — credits bot_stars
         try:
             paid_amount = int(sp.total_amount or 0)
         except Exception:
             paid_amount = 0
-        # credit bot by paid_amount (we assume STAR_UNIT_MULTIPLIER=1)
         if paid_amount > 0:
             await change_bot_stars(paid_amount)
             await add_user_spent_real(payer_id, paid_amount)
-        # reset payer virtual to 0 (per requirement)
+        # reset payer virtual balance to 0 (user paid)
         await set_user_virtual(payer_id, 0)
-        # start the game in payer's chat, with premium if requested
+        # start game in payer's private chat
+        if game_locks.get(payer_id):
+            await bot.send_message(payer_id, "Сейчас идёт другая игра в этом чате — ваша оплата зачислена, игра начнётся позже.")
+            return
         await start_game_flow(payer_id, cnt, bool(prem_flag), payer_id)
         return
-    # handle buy_virtual_... fallback (not main path)
+    # fallback: other payload types handled if needed
     if payload.startswith("buy_virtual_"):
         try:
             parts = payload.split("_")
-            # buy_virtual_{user}_{missing}_{ts}
             target_user = int(parts[2])
             missing = int(parts[3])
             await change_user_virtual(target_user, missing)
@@ -818,7 +828,7 @@ async def pay_virtual_cb(call: types.CallbackQuery):
     prices = [LabeledPrice(label=f"Играть за {missing}⭐", amount=amount)]
     payload = f"buy_virtual_{user.id}_{missing}_{int(time.time())}"
     try:
-        await bot.send_invoice(
+        invoice_msg = await bot.send_invoice(
             chat_id=user.id,
             title=f"{missing} мячей",
             description="Пополнение виртуальных звёзд",
@@ -828,6 +838,7 @@ async def pay_virtual_cb(call: types.CallbackQuery):
             payload=payload,
             start_parameter="buyvirtual"
         )
+        invoice_map[payload] = (invoice_msg.chat.id, invoice_msg.message_id)
     except Exception:
         log.exception("send_invoice failed")
         await call.message.answer("Не удалось создать платёж.")
@@ -893,7 +904,7 @@ async def balans_cmd(message: types.Message):
     await message.answer("Использование: баланс OR баланс <user> <amount> (только в группе)")
 
 # --------------------
-# Web app endpoint to auto-copy link
+# Web app HTML for copy
 # --------------------
 WEBAPP_HTML = r"""<!doctype html>
 <html>
