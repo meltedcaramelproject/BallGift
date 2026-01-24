@@ -79,8 +79,8 @@ STAR_UNIT_MULTIPLIER = 1
 # Free cooldown seconds
 FREE_COOLDOWN = 3 * 60  # 3 minutes
 
-# Minimal wait after first throw before showing results (changed to 7s)
-MIN_WAIT_FROM_FIRST_THROW = 7.0
+# Minimal wait after last throw before showing results (4 seconds from last throw)
+MIN_WAIT_FROM_LAST_THROW = 4.0
 
 # --------------------
 # UI Helpers
@@ -350,6 +350,19 @@ async def change_bot_stars(delta: int) -> int:
     bot._mem_bot_stars = cur
     return cur
 
+async def set_bot_stars_absolute(value: int) -> int:
+    """Установить абсолютное значение звёзд у бота (используется командой в группе)."""
+    if db_pool:
+        try:
+            async with db_pool.acquire() as conn:
+                await conn.execute("INSERT INTO bot_state (key, value) VALUES ('bot_stars', $1) ON CONFLICT (key) DO UPDATE SET value = $1", value)
+                val = await conn.fetchval("SELECT value FROM bot_state WHERE key='bot_stars'")
+                return int(val or 0)
+        except Exception:
+            log.exception("set_bot_stars_absolute DB failed")
+    bot._mem_bot_stars = max(value, 0)
+    return bot._mem_bot_stars
+
 # --------------------
 # Referrals (SQL)
 # --------------------
@@ -495,7 +508,7 @@ async def get_stats_summary() -> str:
     return "\n".join(lines)
 
 # --------------------
-# Game flow (uses MIN_WAIT_FROM_FIRST_THROW)
+# Game flow (wait 4s from last throw)
 # --------------------
 async def start_game_flow(chat_id: int, count: int, premium: bool, user_id: int):
     if game_locks.get(chat_id):
@@ -503,22 +516,22 @@ async def start_game_flow(chat_id: int, count: int, premium: bool, user_id: int)
     game_locks[chat_id] = True
     try:
         messages = []
-        first_send_time = None
+        last_send_time = None
         for i in range(count):
             try:
                 msg = await bot.send_dice(chat_id, emoji="🏀")
             except Exception:
                 log.exception("send_dice failed")
                 continue
-            if first_send_time is None:
-                first_send_time = time.monotonic()
+            last_send_time = time.monotonic()
             messages.append(msg)
             await asyncio.sleep(0.5)
-        if first_send_time is None:
-            first_send_time = time.monotonic()
-        elapsed = time.monotonic() - first_send_time
-        if elapsed < MIN_WAIT_FROM_FIRST_THROW:
-            await asyncio.sleep(MIN_WAIT_FROM_FIRST_THROW - elapsed)
+        if last_send_time is None:
+            last_send_time = time.monotonic()
+        elapsed = time.monotonic() - last_send_time
+        wait_for = MIN_WAIT_FROM_LAST_THROW - elapsed
+        if wait_for > 0:
+            await asyncio.sleep(wait_for)
         hits = 0
         results = []
         for msg in messages:
@@ -569,7 +582,7 @@ async def start_game_flow(chat_id: int, count: int, premium: bool, user_id: int)
                             await bot.send_message(GROUP_ID, f"<a href=\"tg://user?id={user_id}\">{user_id}</a> выиграл подарок.\nПотрачено им: {spent}⭐\nЗаработано им: {gift_cost}⭐", parse_mode=ParseMode.HTML)
                         except Exception:
                             pass
-        # results summary
+        # results summary (no numbered IDs)
         text_lines = ["🎯 <b>Результаты бросков:</b>\n"]
         if results:
             for v in results:
@@ -694,8 +707,10 @@ async def play_callback(call: types.CallbackQuery):
             rem = free_next - now
             mins = rem // 60
             secs = rem % 60
-            # show as notification (not message)
-            await call.answer(f"🏀 Вы сможете повторно сделать бесплатный бросок через {mins} минут и {secs} секунд", show_alert=False)
+            min_word = "минут" if mins != 1 else "минуту"
+            sec_word = "секунд" if secs != 1 else "секунду"
+            # show popup notification
+            await call.answer(f"🏀 Вы сможете повторно сделать бесплатный бросок через {mins} {min_word} и {secs} {sec_word}", show_alert=True)
             return
         await set_user_free_next(user_id, now + FREE_COOLDOWN)
         await start_game_flow(chat_id, cnt, premium, user_id)
@@ -859,13 +874,22 @@ async def balans_cmd(message: types.Message):
     lowered = text.lower()
     if not (lowered.startswith("/баланс") or lowered.split()[0] == "баланс"):
         return
+    # only in group
     if GROUP_ID is None or message.chat.id != GROUP_ID:
         return
     parts = text.split()
+    # /баланс 123  -> set bot stars absolute
+    if len(parts) == 2 and parts[1].lstrip("-").isdigit():
+        amount = int(parts[1])
+        newval = await set_bot_stars_absolute(amount)
+        await message.answer(f"Баланс бота (реальные звёзд) установлен: <b>{newval}</b>")
+        return
+    # /баланс -> show bot stars
     if len(parts) == 1:
         b = await get_bot_stars()
         await message.answer(f"💰 Баланс бота (реальные звёзд): <b>{b}</b>")
         return
+    # /баланс <user> <amount> -> set user's virtual stars
     if len(parts) >= 3:
         user_token = parts[1]
         amount_token = parts[2]
@@ -880,6 +904,7 @@ async def balans_cmd(message: types.Message):
                 await message.answer("Не удалось найти пользователя.")
                 return
         else:
+            # try to resolve username/chat
             try:
                 chat = await bot.get_chat(user_token)
                 target_id = chat.id
@@ -893,7 +918,7 @@ async def balans_cmd(message: types.Message):
         await set_user_virtual(target_id, amount)
         await message.answer(f"Баланс пользователя {target_id} установлен: <b>{amount}⭐</b>")
         return
-    await message.answer("Использование: баланс OR баланс <user> <amount> (только в группе)")
+    await message.answer("Использование: баланс OR баланс <число> (устанавливает реальный баланс бота) OR баланс <user> <amount> (устанавливает виртуальные звёзды пользователю) — только в группе.")
 
 # --------------------
 # Web app HTML for copy
