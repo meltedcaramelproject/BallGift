@@ -27,7 +27,7 @@ log = logging.getLogger("ballbot")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 GROUP_ID_RAW = os.getenv("GROUP_ID", "")
-PUBLIC_URL = os.getenv("PUBLIC_URL", "")  # e.g. https://myapp.onrender.com — required for WebApp copy feature
+PUBLIC_URL = os.getenv("PUBLIC_URL", "")  # for WebApp copy feature (https required)
 PAYMENTS_PROVIDER_TOKEN = os.getenv("PAYMENTS_PROVIDER_TOKEN", "")  # leave empty for Telegram Stars (XTR)
 ADMIN_ID = os.getenv("ADMIN_ID")
 
@@ -56,15 +56,15 @@ db_pool: Optional[asyncpg.Pool] = None
 game_locks: dict[int, bool] = {}
 
 # Config for buttons: (key, count, virtual_cost, label_prefix, premium_flag)
-BUTTONS = [
-    ("p6", 6, 0, "", False),
-    ("p5", 5, 1, "", False),
-    ("p4", 4, 2, "", False),
-    ("p3", 3, 4, "", False),
-    ("p2", 2, 6, "", False),
-    ("p1", 1, 10, "", False),   # single ball changed to 10⭐
-    ("prem1", 1, 15, "💎", True) # premium single ball 15⭐
-]
+BUTTONS = {
+    "p6": (6, 0, False, ""),
+    "p5": (5, 1, False, ""),
+    "p4": (4, 2, False, ""),
+    "p3": (3, 4, False, ""),
+    "p2": (2, 6, False, ""),
+    "p1": (1, 10, False, ""),
+    "prem1": (1, 15, True, "💎")
+}
 
 # Gift real-star costs and premium gifts
 GIFT_VALUES = {"normal": 15, "premium": 25}
@@ -83,13 +83,34 @@ def word_form_mяч(count: int) -> str:
     return "мяча" if 1 <= count <= 4 else "мячей"
 
 def build_main_keyboard(user_id: Optional[int] = None) -> InlineKeyboardMarkup:
+    """
+    Layout requested:
+    Row1: 6
+    Row2: 5,4
+    Row3: 3,2
+    Row4: 1, prem1
+    Row5: stars for friend
+    """
     kb = []
-    for key, count, cost, prefix, premium in BUTTONS:
-        noun = word_form_mяч(count)
+    def btn_text(key):
+        cnt, cost, prem, prefix = (BUTTONS[key][0], BUTTONS[key][1], BUTTONS[key][2], BUTTONS[key][3])
+        noun = word_form_mяч(cnt)
         cost_text = "бесплатно" if cost == 0 else f"{cost}⭐"
-        text = f"{prefix}🏀 {count} {noun} • {cost_text}"
-        cb = f"play_{key}"
-        kb.append([InlineKeyboardButton(text=text, callback_data=cb)])
+        prefix = BUTTONS[key][3]
+        return f"{prefix}🏀 {cnt} {noun} • {cost_text}", f"play_{key}"
+
+    # row1
+    t, cb = btn_text("p6"); kb.append([InlineKeyboardButton(text=t, callback_data=cb)])
+    # row2
+    t1, cb1 = btn_text("p5"); t2, cb2 = btn_text("p4")
+    kb.append([InlineKeyboardButton(text=t1, callback_data=cb1), InlineKeyboardButton(text=t2, callback_data=cb2)])
+    # row3
+    t1, cb1 = btn_text("p3"); t2, cb2 = btn_text("p2")
+    kb.append([InlineKeyboardButton(text=t1, callback_data=cb1), InlineKeyboardButton(text=t2, callback_data=cb2)])
+    # row4
+    t1, cb1 = btn_text("p1"); t2, cb2 = btn_text("prem1")
+    kb.append([InlineKeyboardButton(text=t1, callback_data=cb1), InlineKeyboardButton(text=t2, callback_data=cb2)])
+    # row5
     kb.append([InlineKeyboardButton(text="+3⭐ за друга", callback_data="ref_menu")])
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
@@ -114,14 +135,15 @@ def build_ref_keyboard(user_id: int) -> InlineKeyboardMarkup:
     # share link button (opens share chooser)
     me_username = ""
     try:
-        # synchronous call would block; use create_task? but safe to await here as handler will await later.
-        # We'll try to get username but ignore errors.
+        # best-effort get bot username
         me = asyncio.get_event_loop().run_until_complete(bot.get_me())
         me_username = me.username or ""
     except Exception:
         me_username = ""
     link = f"https://t.me/{me_username}?start={user_id}" if me_username else f"/start {user_id}"
-    share_url = f"https://t.me/share/url?url={urllib.parse.quote(link)}&text={urllib.parse.quote('🏀 Приглашаю тебя сыграть в баскет за подарки! 🎁\\n')}{urllib.parse.quote(link)}"
+    # message text for sharing
+    share_text = f"🏀 Приглашаю тебя сыграть в баскет за подарки!\n{link}"
+    share_url = f"https://t.me/share/url?text={urllib.parse.quote(share_text)}"
     buttons = [
         [InlineKeyboardButton(text="➡️ Отправить другу", url=share_url)],
     ]
@@ -194,7 +216,7 @@ async def init_db():
         db_pool = None
 
 # --------------------
-# DB helpers (full SQL-backed implementations with in-memory fallback)
+# DB helpers (SQL-backed with in-memory fallback)
 # --------------------
 async def ensure_user(user_id: int) -> Tuple[int, int]:
     if db_pool:
@@ -348,31 +370,21 @@ async def change_bot_stars(delta: int) -> int:
 # Referrals (SQL)
 # --------------------
 async def register_ref_visit(referred_user: int, inviter: int) -> bool:
-    """
-    Save referral visit. Notify inviter (private) and group (GROUP_ID).
-    Returns True if recorded (i.e. first time), False if already existed.
-    """
     if db_pool:
         try:
             async with db_pool.acquire() as conn:
                 res = await conn.execute("INSERT INTO referrals (referred_user, inviter, plays, rewarded) VALUES ($1, $2, 0, FALSE) ON CONFLICT (referred_user) DO NOTHING", referred_user, inviter)
-                # res like "INSERT 0 1" when inserted
                 if res and res.endswith(" 1"):
-                    # notify inviter privately (if possible)
+                    # notify inviter
                     try:
-                        # fetch referred user's first_name/username for nicer message if available
                         u = await bot.get_chat(referred_user)
-                        if getattr(u, "username", None):
-                            mention = f"@{u.username}"
-                        else:
-                            mention = u.first_name or str(referred_user)
+                        mention = f"@{u.username}" if getattr(u, "username", None) else (u.first_name or str(referred_user))
                     except Exception:
                         mention = str(referred_user)
                     try:
                         await bot.send_message(inviter, f"🔗 По вашей ссылке перешёл {mention}\nВы получите <b>+3⭐</b> на баланс после того, как он сыграет 5 раз в баскетбол", parse_mode=ParseMode.HTML)
                     except Exception:
-                        log.exception("notify inviter failed")
-                    # group notification
+                        pass
                     if GROUP_ID:
                         try:
                             await bot.send_message(GROUP_ID, f"{mention} перешёл по реферальной ссылке к {inviter}")
@@ -383,7 +395,6 @@ async def register_ref_visit(referred_user: int, inviter: int) -> bool:
         except Exception:
             log.exception("register_ref_visit DB failed")
             return False
-    # fallback in-memory
     if not hasattr(bot, "_mem_referrals"):
         bot._mem_referrals = {}
     if referred_user in bot._mem_referrals:
@@ -401,9 +412,6 @@ async def register_ref_visit(referred_user: int, inviter: int) -> bool:
     return True
 
 async def increment_referred_play(referred_user: int):
-    """
-    Increase play count for referred user; when reaches 5, reward inviter with +3 virtual stars.
-    """
     if db_pool:
         try:
             async with db_pool.acquire() as conn:
@@ -417,12 +425,10 @@ async def increment_referred_play(referred_user: int):
                 if plays >= 5:
                     await conn.execute("UPDATE referrals SET plays=$1, rewarded=TRUE WHERE referred_user=$2", plays, referred_user)
                     await change_user_virtual(inviter, 3)
-                    # notify inviter and group
                     try:
                         await bot.send_message(inviter, "🔥 Вам начислено +3⭐ — приглашённый сыграл 5 раз!")
                     except Exception:
                         pass
-                    # count verified referrals of inviter
                     cnt = await conn.fetchval("SELECT COUNT(*) FROM referrals WHERE inviter=$1 AND rewarded=TRUE", inviter)
                     if GROUP_ID:
                         try:
@@ -434,7 +440,6 @@ async def increment_referred_play(referred_user: int):
         except Exception:
             log.exception("increment_referred_play DB failed")
     else:
-        # fallback
         mem = getattr(bot, "_mem_referrals", {})
         rec = mem.get(referred_user)
         if not rec or rec.get("rewarded"):
@@ -455,7 +460,7 @@ async def increment_referred_play(referred_user: int):
                     pass
 
 # --------------------
-# Stats: inc and summary
+# Stats
 # --------------------
 async def inc_stats(count: int, premium: bool, win: bool):
     if db_pool:
@@ -480,14 +485,13 @@ async def inc_stats(count: int, premium: bool, win: bool):
 
 async def get_stats_summary() -> str:
     lines = []
-    # users count
     if db_pool:
         try:
             async with db_pool.acquire() as conn:
-                users_count = await conn.fetchval("SELECT COUNT(*) FROM users")
+                users_count = int(await conn.fetchval("SELECT COUNT(*) FROM users") or 0)
                 botstars = int(await conn.fetchval("SELECT value FROM bot_state WHERE key='bot_stars'") or 0)
                 rows = await conn.fetch("SELECT count, premium, wins, losses FROM stats ORDER BY count DESC, premium ASC")
-                lines.append(f"Пользователей в боте: {int(users_count or 0)}")
+                lines.append(f"Пользователей в боте: {users_count}")
                 lines.append(f"Реальных звёзд у бота: {botstars}")
                 for r in rows:
                     cnt = r["count"]
@@ -511,17 +515,7 @@ async def get_stats_summary() -> str:
 # --------------------
 # Game flow
 # --------------------
-def find_button_by_key(key: str):
-    for k, cnt, cost, prefix, prem in BUTTONS:
-        if k == key:
-            return (k, cnt, cost, prefix, prem)
-    return None
-
 async def start_game_flow(chat_id: int, count: int, premium: bool, user_id: int):
-    """
-    Runs the game: sends dice with 0.5s gap, waits until at least 5s from first send,
-    calculates hits, awards gifts by deducting bot_stars, updates stats and sends messages.
-    """
     if game_locks.get(chat_id):
         return False, "busy"
     game_locks[chat_id] = True
@@ -543,7 +537,6 @@ async def start_game_flow(chat_id: int, count: int, premium: bool, user_id: int)
         elapsed = time.monotonic() - first_send_time
         if elapsed < 5.0:
             await asyncio.sleep(5.0 - elapsed)
-        # collect results
         hits = 0
         results = []
         for msg in messages:
@@ -551,7 +544,6 @@ async def start_game_flow(chat_id: int, count: int, premium: bool, user_id: int)
             results.append(int(v))
             if int(v) >= 4:
                 hits += 1
-        # updates
         await inc_user_plays(user_id, len(results))
         await increment_referred_play(user_id)
         await inc_stats(count, premium, hits == len(results) and len(results) > 0)
@@ -570,7 +562,7 @@ async def start_game_flow(chat_id: int, count: int, premium: bool, user_id: int)
                     await bot.send_message(chat_id, gift_text)
                     if GROUP_ID:
                         try:
-                            spent = await (getattr(db_pool, 'fetchval', None) and db_pool.fetchval("SELECT spent_real FROM users WHERE user_id=$1", user_id) or 0)
+                            spent = int(await (db_pool.fetchval("SELECT spent_real FROM users WHERE user_id=$1", user_id) if db_pool else 0) or 0)
                         except Exception:
                             spent = 0
                         try:
@@ -588,7 +580,7 @@ async def start_game_flow(chat_id: int, count: int, premium: bool, user_id: int)
                     await bot.send_message(chat_id, "🎁 Вы выиграли: 🐻 Мишка или 💖 Сердечко")
                     if GROUP_ID:
                         try:
-                            spent = await (getattr(db_pool, 'fetchval', None) and db_pool.fetchval("SELECT spent_real FROM users WHERE user_id=$1", user_id) or 0)
+                            spent = int(await (db_pool.fetchval("SELECT spent_real FROM users WHERE user_id=$1", user_id) if db_pool else 0) or 0)
                         except Exception:
                             spent = 0
                         try:
@@ -604,7 +596,7 @@ async def start_game_flow(chat_id: int, count: int, premium: bool, user_id: int)
             text_lines.append("⚠️ Не удалось отправить ни одного мяча.")
         await bot.send_message(chat_id, "\n".join(text_lines))
         await asyncio.sleep(1)
-        await bot.send_message(chat_id, "✅ ПОПАДАНИЕ!" if len(results) > 0 and hits == len(results) else "🟡 Не все попали. Попробуем ещё?")
+        await bot.send_message(chat_id, "✅ ПОПАДАНИЕ!" if len(results)>0 and hits==len(results) else "🟡 Не все попали. Попробуем ещё?")
         await asyncio.sleep(1)
         vnow = await get_user_virtual(user_id)
         await bot.send_message(chat_id, START_TEXT_TEMPLATE.format(virtual_stars=vnow), reply_markup=build_main_keyboard(user_id))
@@ -667,7 +659,6 @@ async def ref_menu(call: types.CallbackQuery):
 
 @dp.callback_query(lambda c: c.data and c.data.startswith("copy_ref_"))
 async def copy_ref_alert(call: types.CallbackQuery):
-    # fallback when PUBLIC_URL not provided -> show alert with link
     try:
         uid = int(call.data.split("_", 2)[2])
     except Exception:
@@ -695,19 +686,17 @@ async def ref_back(call: types.CallbackQuery):
 @dp.callback_query(lambda c: c.data and c.data.startswith("play_"))
 async def play_callback(call: types.CallbackQuery):
     chat_id = call.message.chat.id
-    # Block concurrent games per chat
     if game_locks.get(chat_id):
         await call.answer("Сначала дождитесь окончания текущей игры!", show_alert=False)
         return
     await call.answer()
     user_id = call.from_user.id
     key = call.data.split("_", 1)[1]
-    info = find_button_by_key(key)
-    if not info:
+    if key not in BUTTONS:
         await call.message.answer("Неизвестная кнопка.")
         return
-    k, count, cost, prefix, premium = info
-    # Free button logic (cooldown)
+    cnt, cost, premium, prefix = BUTTONS[key]
+    # free button logic
     if cost == 0:
         now = int(time.time())
         free_next = await get_user_free_next(user_id)
@@ -719,34 +708,32 @@ async def play_callback(call: types.CallbackQuery):
             sec_word = "секунд" if secs != 1 else "секунду"
             await call.answer(f"🏀 Вы сможете повторно сделать бесплатный бросок через {mins} {min_word} и {secs} {sec_word}", show_alert=False)
             return
-        # set new free_next
         await set_user_free_next(user_id, now + FREE_COOLDOWN)
-        # start game
-        await start_game_flow(chat_id, count, premium, user_id)
+        await start_game_flow(chat_id, cnt, premium, user_id)
         return
-    # Paid buttons: check virtual balance
+    # paid flow
     vstars = await get_user_virtual(user_id)
     if vstars >= cost:
-        # deduct virtual and credit bot_stars
         await change_user_virtual(user_id, -cost)
         await change_bot_stars(cost)
-        await start_game_flow(chat_id, count, premium, user_id)
+        await start_game_flow(chat_id, cnt, premium, user_id)
         return
-    # insufficient virtual: immediately create invoice (one message) named "<N> мяч/мяча/мячей"
+    # insufficient -> immediately create invoice and send to user's private chat
     missing = cost - vstars
-    noun = word_form_mяч(count)
-    title = f"{count} {noun}"
+    noun = word_form_mяч(cnt)
+    title = f"{cnt} {noun}"
     description = "🎁 Получай крутой подарок за попадание 🏀 в кольцо"
     label = f"Играть за {missing}⭐"
     amount = int(missing * STAR_UNIT_MULTIPLIER)
     prices = [LabeledPrice(label=label, amount=amount)]
-    payload = f"buy_and_play_{user_id}_{count}_{missing}_{int(time.time())}"
+    # payload includes count and premium flag
+    payload = f"buy_and_play:{cnt}:{1 if premium else 0}"
     try:
         await bot.send_invoice(
             chat_id=user_id,
             title=title,
             description=description,
-            provider_token=PAYMENTS_PROVIDER_TOKEN,  # empty for Stars
+            provider_token=PAYMENTS_PROVIDER_TOKEN,
             currency="XTR",
             prices=prices,
             payload=payload,
@@ -767,37 +754,45 @@ async def precheckout_handler(pre_q: PreCheckoutQuery):
 async def on_successful_payment(message: types.Message):
     sp = message.successful_payment
     payload = getattr(sp, "invoice_payload", "") or ""
-    if payload.startswith("buy_and_play_"):
-        # buy_and_play_{user}_{count}_{missing}_{ts}
+    payer_id = message.from_user.id
+    # payload pattern: buy_and_play:{count}:{premium_flag} or buy_virtual...
+    if payload.startswith("buy_and_play:") or payload.startswith("buy_and_play"):
         try:
-            parts = payload.split("_")
-            _, _, uid_str, count_str, missing_str, *_ = parts
-            uid = int(uid_str)
-            count = int(count_str)
-            missing = int(missing_str)
+            # support both colon and underscore variants
+            parts = payload.replace("buy_and_play_", "buy_and_play:").split(":")
+            # parts = ['buy_and_play', '{count}', '{premium_flag}', ...]
+            if len(parts) >= 3:
+                cnt = int(parts[1])
+                prem_flag = int(parts[2]) if len(parts) >= 3 else 0
+            else:
+                # fallback: if payload included missing stars as amount, try parse differently
+                cnt = 1
+                prem_flag = 0
         except Exception:
-            await message.answer("Платёж принят. Благодарим!")
-            return
-        # credit bot_stars and record spent_real
-        await change_bot_stars(missing)
-        await add_user_spent_real(uid, missing)
-        # reset user's virtual to 0
-        await set_user_virtual(uid, 0)
-        # start game in user's private chat
-        chat_id = uid
-        if game_locks.get(chat_id):
-            await bot.send_message(chat_id, "Сейчас идёт другая игра в этом чате — ваша оплата зачислена, игра начнётся позже.")
-            return
-        # start (non-premium; premium would require different payload)
-        await start_game_flow(chat_id, count, False, uid)
+            cnt = 1
+            prem_flag = 0
+        # amount paid in successful_payment: use total_amount (in smallest units) if present
+        # For currency XTR we used amount equal to number of stars; get it from successful_payment.total_amount if available
+        try:
+            paid_amount = int(sp.total_amount or 0)
+        except Exception:
+            paid_amount = 0
+        # credit bot by paid_amount (we assume STAR_UNIT_MULTIPLIER=1)
+        if paid_amount > 0:
+            await change_bot_stars(paid_amount)
+            await add_user_spent_real(payer_id, paid_amount)
+        # reset payer virtual to 0 (per requirement)
+        await set_user_virtual(payer_id, 0)
+        # start the game in payer's chat, with premium if requested
+        await start_game_flow(payer_id, cnt, bool(prem_flag), payer_id)
         return
-    # fallback for buy_virtual_xxx
+    # handle buy_virtual_... fallback (not main path)
     if payload.startswith("buy_virtual_"):
         try:
             parts = payload.split("_")
-            _, _, user_str, missing_str, *_ = parts
-            target_user = int(user_str)
-            missing = int(missing_str)
+            # buy_virtual_{user}_{missing}_{ts}
+            target_user = int(parts[2])
+            missing = int(parts[3])
             await change_user_virtual(target_user, missing)
             await change_bot_stars(missing)
             await add_user_spent_real(target_user, missing)
@@ -927,7 +922,6 @@ async function doCopy(){
     document.getElementById('status').innerText='Готово — ссылка скопирована в буфер обмена!';
     document.getElementById('msg').innerText=decodeURIComponent(link);
     document.getElementById('btn').style.display='block';
-    // If opened inside Telegram WebApp, try to close automatically after short delay
     if(window.Telegram && window.Telegram.WebApp && window.Telegram.WebApp.close){
       setTimeout(()=>{ try{ window.Telegram.WebApp.close(); }catch(e){} }, 700);
     }
@@ -948,13 +942,11 @@ doCopy();
 """
 
 async def webapp_copy_handler(request):
-    # expects query param 'link' URL-encoded
     link = request.query.get('link', '')
-    # return HTML with link param embedded (the JS decodes it)
     return web.Response(text=WEBAPP_HTML, content_type='text/html')
 
 # --------------------
-# Health endpoint and web server setup
+# Health & web server
 # --------------------
 async def handle_health(request):
     return web.Response(text="OK")
@@ -964,7 +956,7 @@ async def start_web():
     app.add_routes([
         web.get("/", handle_health),
         web.get("/health", handle_health),
-        web.get("/webapp/copy", webapp_copy_handler)  # WebApp copy route
+        web.get("/webapp/copy", webapp_copy_handler)
     ])
     port = int(os.getenv("PORT", "8000"))
     runner = web.AppRunner(app)
@@ -979,7 +971,6 @@ async def start_web():
 async def main():
     log.info("Starting bot")
     await init_db()
-    # try fetch me (best-effort)
     try:
         await bot.get_me()
     except Exception:
