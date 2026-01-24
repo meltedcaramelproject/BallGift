@@ -65,7 +65,7 @@ BUTTONS = {
     "p4": (4, 2, False, ""),
     "p3": (3, 4, False, ""),
     "p2": (2, 6, False, ""),
-    "p1": (1, 10, False, ""),   # single ball 10⭐ (label will be "мяч")
+    "p1": (1, 10, False, ""),   # single ball 10⭐ (label "мяч")
     "prem1": (1, 15, True, "💎") # premium single ball 15⭐ (label "мяч")
 }
 
@@ -137,19 +137,33 @@ REPLY_MENU = ReplyKeyboardMarkup(
 )
 
 def build_ref_keyboard_with_link(user_id: int, bot_username: str) -> InlineKeyboardMarkup:
-    # build keyboard using actual bot_username (guarantees proper https link)
+    """
+    Builds referral keyboard:
+     - "➡️ Отправить другу" -> share URL (opens chooser)
+     - "🔗 Скопировать ссылку" -> natively copies text to clipboard via copy_text (if client supports)
+     - "◀️ Назад"
+    """
     if bot_username:
         link = f"https://t.me/{bot_username}?start={user_id}"
     else:
         link = f"/start {user_id}"
     share_text = f"🏀 Приглашаю тебя сыграть в баскет за подарки!\n{link}"
     share_url = f"https://t.me/share/url?text={urllib.parse.quote(share_text)}"
-    buttons = [[InlineKeyboardButton(text="➡️ Отправить другу", url=share_url)]]
-    if PUBLIC_URL:
-        copy_url = f"{PUBLIC_URL.rstrip('/')}/webapp/copy?link={urllib.parse.quote(link, safe='')}"
-        buttons.append([InlineKeyboardButton(text="🔗 Скопировать ссылку", web_app=WebAppInfo(url=copy_url))])
-    else:
-        buttons.append([InlineKeyboardButton(text="🔗 Скопировать ссылку", callback_data=f"copy_ref_{user_id}")])
+
+    buttons = []
+    buttons.append([InlineKeyboardButton(text="➡️ Отправить другу", url=share_url)])
+    # Native copy button (Bot API: copy_text). If client supports — it will copy to clipboard.
+    try:
+        # InlineKeyboardButton supports `copy_text` parameter in recent aiogram versions
+        buttons.append([InlineKeyboardButton(text="🔗 Скопировать ссылку", copy_text=link)])
+    except TypeError:
+        # Fallback: if aiogram version doesn't support copy_text param, use webapp/copy or a callback
+        if PUBLIC_URL:
+            copy_url = f"{PUBLIC_URL.rstrip('/')}/webapp/copy?link={urllib.parse.quote(link, safe='')}"
+            buttons.append([InlineKeyboardButton(text="🔗 Скопировать ссылку", web_app=WebAppInfo(url=copy_url))])
+        else:
+            # fallback to simple callback that will show link in alert
+            buttons.append([InlineKeyboardButton(text="🔗 Показать ссылку", callback_data=f"show_ref_{user_id}")])
     buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="ref_back")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -657,8 +671,9 @@ async def ref_menu(call: types.CallbackQuery):
     except Exception:
         await call.message.answer(REF_TEXT_HTML, reply_markup=build_ref_keyboard_with_link(uid, bot_username), parse_mode=ParseMode.HTML)
 
-@dp.callback_query(lambda c: c.data and c.data.startswith("copy_ref_"))
-async def copy_ref_alert(call: types.CallbackQuery):
+@dp.callback_query(lambda c: c.data and c.data.startswith("show_ref_"))
+async def show_ref_callback(call: types.CallbackQuery):
+    # fallback for old aiogram versions / clients: show link in alert
     try:
         uid = int(call.data.split("_", 2)[2])
     except Exception:
@@ -669,7 +684,7 @@ async def copy_ref_alert(call: types.CallbackQuery):
     except Exception:
         bot_username = ""
     link = f"https://t.me/{bot_username}?start={uid}" if bot_username else f"/start {uid}"
-    await call.answer(text=f"Скопируйте ссылку: {link}", show_alert=True)
+    await call.answer(text=link, show_alert=True)
 
 @dp.callback_query(lambda c: c.data == "ref_back")
 async def ref_back(call: types.CallbackQuery):
@@ -709,7 +724,7 @@ async def play_callback(call: types.CallbackQuery):
             secs = rem % 60
             min_word = "минут" if mins != 1 else "минуту"
             sec_word = "секунд" if secs != 1 else "секунду"
-            # show popup notification
+            # show popup notification with remaining time
             await call.answer(f"🏀 Вы сможете повторно сделать бесплатный бросок через {mins} {min_word} и {secs} {sec_word}", show_alert=True)
             return
         await set_user_free_next(user_id, now + FREE_COOLDOWN)
