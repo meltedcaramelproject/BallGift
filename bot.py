@@ -1,11 +1,10 @@
 # Полный файл: bot (1).py
 # Изменения:
-# - убрана логика хранения/изменения баланса бота в БД;
-# - /стат показывает реальный баланс бота через get_my_star_balance();
-# - после каждой игры отправляется сводное сообщение в GROUP_ID в нужном формате;
-# - start_game_flow получил paid_real_amount параметр (сколько реальных звёзд заплатил игрок для этой игры);
-# - при попытке отправить подарок используем send_gift; если не удалось — добавляем в pending_gifts;
-# - все пользовательские данные по-прежнему сохраняются в БД (users, referrals, pending_gifts и пр.).
+# - Убрано уведомление "Откройте оплату в личных сообщениях."
+# - Добавлены бан/разбан (таблица banned_users, команды "бан <юз>", "разбан <юз>")
+# - Добавлена команда "пополнить <число>" (создаёт инвойс admin_topup:<amount>)
+# - Везде проверка бана перед взаимодействиями (callback/message handlers)
+# - Остальная логика сохранена (подарки, очередь pending_gifts, реальный баланс через get_my_star_balance)
 
 import asyncio
 import asyncpg
@@ -171,7 +170,7 @@ async def init_db():
                     rewarded BOOLEAN NOT NULL DEFAULT FALSE
                 )
             """)
-            # keep bot_state table for compatibility but we won't use it for real balance
+            # Keep bot_state for compatibility but real balance will be fetched from Telegram
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS bot_state (
                     key TEXT PRIMARY KEY,
@@ -197,7 +196,13 @@ async def init_db():
                     created_at TIMESTAMP WITH TIME ZONE DEFAULT now()
                 )
             """)
-            # initialize bot_state row for backward compatibility (unused for real balance)
+            # New table: banned users
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS banned_users (
+                    user_id BIGINT PRIMARY KEY,
+                    banned_at TIMESTAMP WITH TIME ZONE DEFAULT now()
+                )
+            """)
             await conn.execute("INSERT INTO bot_state (key, value) VALUES ('bot_stars', 0) ON CONFLICT (key) DO NOTHING")
             for c, prem in [(1, False), (2, False), (3, False), (4, False), (5, False), (6, False), (1, True)]:
                 await conn.execute("INSERT INTO stats (count, premium, wins, losses) VALUES ($1,$2,0,0) ON CONFLICT (count,premium) DO NOTHING", c, prem)
@@ -329,6 +334,43 @@ async def add_pending_gift(user_id: int, amount_stars: int, premium: bool = Fals
     bot._mem_pending_gifts.append({"user_id": user_id, "amount_stars": amount_stars, "premium": premium, "status": "pending", "created_at": int(time.time())})
 
 # --------------------
+# banned users helpers
+# --------------------
+async def ban_user(user_id: int):
+    if db_pool:
+        try:
+            async with db_pool.acquire() as conn:
+                await conn.execute("INSERT INTO banned_users (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING", user_id)
+                return
+        except Exception:
+            log.exception("ban_user DB failed")
+    if not hasattr(bot, "_mem_banned"):
+        bot._mem_banned = set()
+    bot._mem_banned.add(user_id)
+
+async def unban_user(user_id: int):
+    if db_pool:
+        try:
+            async with db_pool.acquire() as conn:
+                await conn.execute("DELETE FROM banned_users WHERE user_id=$1", user_id)
+                return
+        except Exception:
+            log.exception("unban_user DB failed")
+    if hasattr(bot, "_mem_banned"):
+        bot._mem_banned.discard(user_id)
+
+async def is_banned(user_id: int) -> bool:
+    if db_pool:
+        try:
+            async with db_pool.acquire() as conn:
+                row = await conn.fetchrow("SELECT 1 FROM banned_users WHERE user_id=$1", user_id)
+                return bool(row)
+        except Exception:
+            log.exception("is_banned DB failed")
+            return False
+    return user_id in getattr(bot, "_mem_banned", set())
+
+# --------------------
 # Helper to get real bot balance via Telegram API
 # --------------------
 async def get_real_bot_stars() -> int:
@@ -338,14 +380,12 @@ async def get_real_bot_stars() -> int:
     """
     try:
         bal = await bot.get_my_star_balance()
-        # aiogram may return an object with attribute 'amount' (or 'total_amount'), safely extract
         amount = 0
         if hasattr(bal, "amount"):
             amount = getattr(bal, "amount") or 0
         elif hasattr(bal, "total_amount"):
             amount = getattr(bal, "total_amount") or 0
         else:
-            # if bal is a dict-like
             try:
                 amount = int(bal.get("amount", 0))
             except Exception:
@@ -353,7 +393,6 @@ async def get_real_bot_stars() -> int:
         return int(amount or 0)
     except Exception:
         log.exception("get_my_star_balance failed")
-        # fallback to 0 or stored mem
         return int(getattr(bot, "_mem_bot_stars", 0) or 0)
 
 # --------------------
@@ -376,11 +415,6 @@ async def inc_user_plays(user_id: int, cnt: int = 1):
 # Helpers to get nice actor display (username first, else clickable name)
 # --------------------
 async def get_user_display_short(user_id: int) -> str:
-    """
-    Returns a short display string for use in logs/messages:
-    - If user has username, returns @username
-    - Else returns clickable link to open PM with the user's first name (or id)
-    """
     try:
         u = await bot.get_chat(user_id)
         if getattr(u, "username", None):
@@ -388,13 +422,9 @@ async def get_user_display_short(user_id: int) -> str:
         name = getattr(u, "first_name", None) or str(user_id)
         return f'<a href="tg://user?id={user_id}">{name}</a>'
     except Exception:
-        # fallback to id link
         return f'<a href="tg://user?id={user_id}">{user_id}</a>'
 
 async def get_user_mention_link(user_id: int) -> str:
-    """
-    Returns a clickable mention for the referred user:
-    """
     try:
         u = await bot.get_chat(user_id)
         display = getattr(u, "username", None) or getattr(u, "first_name", None) or str(user_id)
@@ -406,11 +436,6 @@ async def get_user_mention_link(user_id: int) -> str:
 # Try to send a real Telegram gift now (fallback to pending_gifts if fail)
 # --------------------
 async def try_send_real_gift(user_id: int, chat_id: int, amount_stars: int, premium: bool = False) -> bool:
-    """
-    Attempt to send a real Telegram Gift immediately.
-    Returns True if sent, False if failed (in which case caller will queue pending_gifts).
-    Note: we do not adjust any DB balance; Telegram itself will deduct stars on successful send.
-    """
     try:
         gifts_obj = await bot.get_available_gifts()
         gifts_list = getattr(gifts_obj, "gifts", []) or []
@@ -446,11 +471,6 @@ async def try_send_real_gift(user_id: int, chat_id: int, amount_stars: int, prem
 # Referrals & stats & game flow
 # --------------------
 async def register_ref_visit(referred_user: int, inviter: int) -> bool:
-    """
-    Register that referred_user came from inviter link.
-    Send message to inviter in required format:
-    "🔗 По вашей ссылке перешёл <никнейм_перешедшего_ссылка>. Вы получите +3⭐ после того, как он сыграет 5 игр"
-    """
     if db_pool:
         try:
             async with db_pool.acquire() as conn:
@@ -472,7 +492,6 @@ async def register_ref_visit(referred_user: int, inviter: int) -> bool:
         except Exception:
             log.exception("register_ref_visit DB failed")
             return False
-    # in-memory fallback
     if not hasattr(bot, "_mem_referrals"):
         bot._mem_referrals = {}
     if referred_user in bot._mem_referrals:
@@ -563,12 +582,16 @@ async def inc_stats(count: int, premium: bool, win: bool):
             rec["losses"] += 1
 
 # --------------------
-# Game flow (wait MIN_WAIT_FROM_LAST_THROW from last throw)
+# Game flow
 # --------------------
 async def start_game_flow(chat_id: int, count: int, premium: bool, user_id: int, paid_real_amount: int = 0):
-    """
-    paid_real_amount: how many real Telegram stars the player paid for this game (0 if not paid via invoice)
-    """
+    if await is_banned(user_id):
+        try:
+            await bot.send_message(user_id, "⚠️ Вы забанены и не можете участвовать в играх.")
+        except Exception:
+            pass
+        return False, "banned"
+
     if game_locks.get(chat_id):
         return False, "busy"
     game_locks[chat_id] = True
@@ -606,29 +629,25 @@ async def start_game_flow(chat_id: int, count: int, premium: bool, user_id: int,
         await increment_referred_play(user_id)
         await inc_stats(count, premium, hits == len(results) and len(results) > 0)
 
-        # Determine win/loss and proceed
         win = len(results) > 0 and hits == len(results)
         won_amount = 0
-        spent_real = paid_real_amount or 0  # amount the user actually paid with Telegram stars for this game
+        spent_real = int(paid_real_amount or 0)
 
         if win:
-            # 1) send hits summary first (exact)
+            # 1) send hits summary
             try:
                 await bot.send_message(chat_id, f"🎯 Вы попали: {hits}/{len(results)}")
             except Exception:
                 log.exception("Failed to send hits summary to chat %s", chat_id)
 
-            # 2) Attempt to send real gift
+            # 2) Try to send gift
             gift_cost = GIFT_VALUES["premium"] if premium else GIFT_VALUES["normal"]
-            # Check real bot balance
             bot_balance_before = await get_real_bot_stars()
-            # Try to send gift if balance sufficient (prefer immediate send)
             if bot_balance_before >= gift_cost:
                 sent = await try_send_real_gift(user_id, chat_id, gift_cost, premium=premium)
                 if sent:
                     won_amount = gift_cost
                 else:
-                    # fallback: queue task (user still won)
                     await add_pending_gift(user_id, gift_cost, premium=premium)
                     won_amount = gift_cost
                     try:
@@ -636,7 +655,6 @@ async def start_game_flow(chat_id: int, count: int, premium: bool, user_id: int,
                     except Exception:
                         log.exception("Failed to send queued gift message to chat %s", chat_id)
             else:
-                # Not enough stars now -> queue gift
                 await add_pending_gift(user_id, gift_cost, premium=premium)
                 won_amount = gift_cost
                 try:
@@ -644,7 +662,6 @@ async def start_game_flow(chat_id: int, count: int, premium: bool, user_id: int,
                 except Exception:
                     log.exception("Failed to send queued gift message to chat %s", chat_id)
 
-            # Get current bot balance AFTER attempted send (to show accurate remainder)
             bot_balance_after = await get_real_bot_stars()
 
             # 3) send main menu immediately
@@ -655,7 +672,7 @@ async def start_game_flow(chat_id: int, count: int, premium: bool, user_id: int,
                 log.exception("Failed to send main menu to chat %s", chat_id)
 
         else:
-            # Non-win: prepare results messages as before
+            # Non-win: existing summary
             text_lines = ["🎯 <b>Результаты бросков:</b>\n"]
             if results:
                 for v in results:
@@ -673,7 +690,6 @@ async def start_game_flow(chat_id: int, count: int, premium: bool, user_id: int,
             except Exception:
                 log.exception("Failed to send follow-up to chat %s", chat_id)
 
-            # For losses, no gift. spent_real already holds real amount paid (0 or >0)
             won_amount = 0
             bot_balance_after = await get_real_bot_stars()
 
@@ -684,15 +700,13 @@ async def start_game_flow(chat_id: int, count: int, premium: bool, user_id: int,
             except Exception:
                 log.exception("Failed to send main menu to chat %s", chat_id)
 
-        # Send required structured message to GROUP_ID if configured
+        # Send group summary to GROUP_ID
         if GROUP_ID:
             try:
                 actor = await get_user_display_short(user_id)
                 emoji = "🎁" if win else "🥺"
                 verb = "выиграл" if win else "проиграл"
-                # spent_real: only show the real Telegram-stars the user paid; if they used free or internal virtual, it's 0
-                # (we rely on paid_real_amount parameter)
-                spent_display = int(spent_real or 0)
+                spent_display = spent_real
                 won_display = int(won_amount or 0)
                 msg = (
                     f"{emoji} Пользователь {actor} {verb}\n\n"
@@ -714,8 +728,14 @@ async def start_game_flow(chat_id: int, count: int, premium: bool, user_id: int,
 # --------------------
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
-    user = message.from_user
-    uid = user.id
+    uid = message.from_user.id
+    if await is_banned(uid):
+        try:
+            await message.answer("⚠️ Вы забанены и не можете взаимодействовать с ботом.")
+        except Exception:
+            pass
+        return
+
     await ensure_user(uid)
     try:
         actor = await get_user_display_short(uid)
@@ -744,7 +764,6 @@ async def cmd_start(message: types.Message):
     v = await get_user_virtual(uid)
     start_text = START_TEXT_TEMPLATE.format(virtual_stars=v)
     try:
-        # Send only the START_TEXT_TEMPLATE (removed "Меню внизу ..." message)
         await message.answer(start_text, reply_markup=build_main_keyboard(uid))
     except Exception:
         pass
@@ -752,12 +771,21 @@ async def cmd_start(message: types.Message):
 @dp.message(F.text == "🏀 Сыграть в баскет")
 async def open_main_menu(message: types.Message):
     uid = message.from_user.id
+    if await is_banned(uid):
+        try:
+            await message.answer("⚠️ Вы забанены и не можете взаимодействовать с ботом.")
+        except Exception:
+            pass
+        return
     v = await get_user_virtual(uid)
     await message.answer(START_TEXT_TEMPLATE.format(virtual_stars=v), reply_markup=build_main_keyboard(uid))
 
 @dp.callback_query(F.data == "ref_menu")
 async def ref_menu(call: types.CallbackQuery):
     uid = call.from_user.id
+    if await is_banned(uid):
+        await call.answer("Вы забанены.", show_alert=True)
+        return
     await call.answer()
     try:
         me = await bot.get_me()
@@ -772,6 +800,9 @@ async def ref_menu(call: types.CallbackQuery):
 @dp.callback_query(F.data == "ref_back")
 async def ref_back(call: types.CallbackQuery):
     uid = call.from_user.id
+    if await is_banned(uid):
+        await call.answer("Вы забанены.", show_alert=True)
+        return
     await call.answer()
     v = await get_user_virtual(uid)
     try:
@@ -786,6 +817,11 @@ async def ref_back(call: types.CallbackQuery):
 async def play_callback(call: types.CallbackQuery):
     chat_id = call.message.chat.id
     user_id = call.from_user.id
+
+    if await is_banned(user_id):
+        await call.answer("Вы забанены.", show_alert=True)
+        return
+
     await ensure_user(user_id)
 
     if game_locks.get(chat_id):
@@ -819,19 +855,16 @@ async def play_callback(call: types.CallbackQuery):
             return
         await set_user_free_next(user_id, now + FREE_COOLDOWN)
         await call.answer()
-        # free game -> paid_real_amount = 0
         await start_game_flow(chat_id, cnt, premium, user_id, paid_real_amount=0)
         return
 
     vstars = await get_user_virtual(user_id)
     if vstars >= cost:
-        # user pays with internal virtual stars (not Telegram real stars) -> we DO NOT change Telegram balance
         await change_user_virtual(user_id, -cost)
         await call.answer()
         await start_game_flow(chat_id, cnt, premium, user_id, paid_real_amount=0)
         return
 
-    # missing real stars => request invoice (user will pay via provider -> real Telegram stars to bot)
     missing = cost - vstars
     noun = word_form_mяч(cnt)
     title = f"{cnt} {noun}"
@@ -853,7 +886,8 @@ async def play_callback(call: types.CallbackQuery):
             start_parameter="buyandplay"
         )
         invoice_map[payload] = (chat_id, invoice_msg.chat.id, invoice_msg.message_id)
-        await call.answer("Откройте оплату в личных сообщениях.", show_alert=False)
+        # Note: per request, DO NOT show text "Откройте оплату в личных сообщениях."
+        await call.answer()
     except Exception:
         log.exception("send_invoice failed")
         await call.answer("Не удалось создать платёж. Проверьте Payments в BotFather.", show_alert=True)
@@ -902,12 +936,9 @@ async def on_successful_payment(message: types.Message):
         except Exception:
             paid_stars = paid_amount_raw
         log.info("Payment accepted: raw=%s -> stars=%s (mult=%s) payer=%s", paid_amount_raw, paid_stars, STAR_UNIT_MULTIPLIER, payer_id)
-        # IMPORTANT: do NOT try to modify DB balance for bot; Telegram will credit bot automatically.
-        # Record user's spent_real in DB for bookkeeping
         if paid_stars > 0:
             await add_user_spent_real(payer_id, paid_stars)
         await set_user_virtual(payer_id, 0)
-        # Start game and pass paid_real_amount so game flow knows user paid real stars
         if game_locks.get(origin_chat_id):
             try:
                 await bot.send_message(payer_id, "Сейчас идёт другая игра в этом чате — ваша оплата зачислена, игра начнётся позже.")
@@ -916,6 +947,31 @@ async def on_successful_payment(message: types.Message):
             return
         await start_game_flow(origin_chat_id, cnt, bool(prem_flag), payer_id, paid_real_amount=int(paid_stars))
         return
+
+    if payload.startswith("admin_topup:"):
+        # Admin top-up invoice paid
+        try:
+            parts = payload.split(":")
+            if len(parts) >= 2:
+                amount = int(parts[1])
+            else:
+                amount = 0
+        except Exception:
+            amount = 0
+        # Telegram will credit the bot automatically. Just confirm.
+        try:
+            await message.answer(f"✅ Пополнение на {amount}⭐ принято. Спасибо!")
+        except Exception:
+            pass
+        # Notify group
+        if GROUP_ID:
+            try:
+                actor = await get_user_display_short(payer_id)
+                await bot.send_message(GROUP_ID, f"🔔 {actor} пополнил баланс бота на {amount}⭐", parse_mode=ParseMode.HTML)
+            except Exception:
+                pass
+        return
+
     if payload.startswith("buy_virtual_"):
         try:
             parts = payload.split("_")
@@ -929,11 +985,20 @@ async def on_successful_payment(message: types.Message):
                 pass
         except Exception:
             pass
-    else:
+        return
+
+    # other payments
+    try:
         await message.answer("Платёж принят. Спасибо!")
+    except Exception:
+        pass
 
 @dp.callback_query(F.data and F.data.startswith("pay_virtual_"))
 async def pay_virtual_cb(call: types.CallbackQuery):
+    uid = call.from_user.id
+    if await is_banned(uid):
+        await call.answer("Вы забанены.", show_alert=True)
+        return
     await call.answer()
     try:
         missing = int(call.data.split("_", 2)[2])
@@ -961,6 +1026,115 @@ async def pay_virtual_cb(call: types.CallbackQuery):
         await call.message.answer("Не удалось создать платёж.")
 
 # --------------------
+# Admin commands: бан, разбан, пополнить
+# These are group-only and require sending from GROUP_ID chat (admins)
+# --------------------
+@dp.message(F.text)
+async def admin_commands_router(message: types.Message):
+    text = (message.text or "").strip()
+    if not text:
+        return
+    lowered = text.split()[0].lower()
+
+    # Only allow admin commands in GROUP_ID
+    if message.chat.id != GROUP_ID:
+        return
+
+    # BAN: "бан <user>" or "/бан <user>"
+    if lowered in ("/бан", "бан"):
+        parts = text.split(maxsplit=1)
+        if len(parts) == 1 and message.reply_to_message:
+            # use reply target
+            target = message.reply_to_message.from_user.id
+        elif len(parts) >= 2:
+            token = parts[1].strip()
+            if token.startswith("@"):
+                try:
+                    chat = await bot.get_chat(token)
+                    target = chat.id
+                except Exception:
+                    await message.reply("Не удалось найти пользователя по username.")
+                    return
+            elif token.isdigit():
+                target = int(token)
+            else:
+                await message.reply("Неверный формат. Используйте: бан <@username|id> или ответьте командой на сообщение пользователя.")
+                return
+        else:
+            await message.reply("Укажите пользователя для бана: бан <@username|id> или ответьте на сообщение.")
+            return
+        await ban_user(target)
+        actor = await get_user_display_short(target)
+        await message.reply(f"✅ Пользователь {actor} забанен.", parse_mode=ParseMode.HTML)
+        return
+
+    # UNBAN: "разбан <user>" or "/разбан <user>"
+    if lowered in ("/разбан", "разбан"):
+        parts = text.split(maxsplit=1)
+        if len(parts) == 1 and message.reply_to_message:
+            target = message.reply_to_message.from_user.id
+        elif len(parts) >= 2:
+            token = parts[1].strip()
+            if token.startswith("@"):
+                try:
+                    chat = await bot.get_chat(token)
+                    target = chat.id
+                except Exception:
+                    await message.reply("Не удалось найти пользователя по username.")
+                    return
+            elif token.isdigit():
+                target = int(token)
+            else:
+                await message.reply("Неверный формат. Используйте: разбан <@username|id> или ответьте командой на сообщение пользователя.")
+                return
+        else:
+            await message.reply("Укажите пользователя для разбанa: разбан <@username|id> или ответьте на сообщение.")
+            return
+        await unban_user(target)
+        actor = await get_user_display_short(target)
+        await message.reply(f"✅ Пользователь {actor} разбанен.", parse_mode=ParseMode.HTML)
+        return
+
+    # TOPUP / пополнить: "пополнить <число>" -> create invoice for admin to pay.
+    if lowered in ("/пополнить", "пополнить"):
+        parts = text.split(maxsplit=1)
+        if len(parts) < 2:
+            await message.reply("Использование: пополнить <число_звёзд>")
+            return
+        try:
+            amount = int(parts[1].strip())
+            if amount <= 0:
+                await message.reply("Сумма должна быть положительным числом.")
+                return
+        except Exception:
+            await message.reply("Неверный формат числа.")
+            return
+        # Create invoice to admin (message.from_user.id)
+        admin_id = message.from_user.id
+        prices = [LabeledPrice(label=f"Пополнение бота на {amount}⭐", amount=int(amount * STAR_UNIT_MULTIPLIER))]
+        payload = f"admin_topup:{amount}:{int(time.time())}"
+        try:
+            invoice_msg = await bot.send_invoice(
+                chat_id=admin_id,
+                title=f"Пополнение бота — {amount}⭐",
+                description="Пополнение реального баланса бота звёздами Telegram",
+                provider_token=PAYMENTS_PROVIDER_TOKEN,
+                currency="XTR",
+                prices=prices,
+                payload=payload,
+                start_parameter="admintopup"
+            )
+            invoice_map[payload] = (message.chat.id, invoice_msg.chat.id, invoice_msg.message_id)
+            await message.reply("Инвойс создан и отправлен администратору в личку.")
+        except Exception:
+            log.exception("send_invoice failed")
+            await message.reply("Не удалось создать инвойс. Проверьте Payments в BotFather.")
+        return
+
+    # If it's /стат or /баланс etc, let existing handler handle them (no conflict)
+    # Otherwise ignore here.
+
+# --------------------
 # Commands: /стат and /баланс (group only)
 # --------------------
 @dp.message(F.text)
@@ -971,24 +1145,21 @@ async def stat_and_balans_router(message: types.Message):
     lowered = text.lower().split()[0]
     # /стат
     if lowered == "/стат" or lowered == "стат":
-        # If in group only (as before)
         if GROUP_ID is None or message.chat.id != GROUP_ID:
             return
         try:
-            # number of users
             if db_pool:
                 async with db_pool.acquire() as conn:
                     users_count = int(await conn.fetchval("SELECT COUNT(*) FROM users") or 0)
             else:
                 users_count = len(getattr(bot, "_mem_users", {}))
-            # real Telegram balance:
             botstars = await get_real_bot_stars()
             await message.answer(f"👤 Пользователей: {users_count}\n⭐ Звёзд на счету бота: {botstars}")
         except Exception:
             log.exception("Failed to produce /стат")
         return
 
-    # /баланс or баланс (admin only remains, but now shows real balance; setting disabled)
+    # /баланс or баланс (group only)
     if lowered.startswith("/баланс") or lowered == "баланс":
         if GROUP_ID is None or message.chat.id != GROUP_ID:
             return
@@ -997,7 +1168,7 @@ async def stat_and_balans_router(message: types.Message):
             b = await get_real_bot_stars()
             await message.answer(f"💰 Баланс бота (реальные звёзд): <b>{b}</b>")
             return
-        # Do not allow manual setting of bot balance (removed DB logic)
+        # disallow manual DB set
         await message.answer("Управление реальным балансом бота запрещено вручную. Баланс формирует Telegram через платежи.")
         return
 
