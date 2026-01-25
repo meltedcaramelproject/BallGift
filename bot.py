@@ -1,10 +1,6 @@
 # Полный файл: bot (1).py
-# Изменения:
-# - Убрано уведомление "Откройте оплату в личных сообщениях."
-# - Добавлены бан/разбан (таблица banned_users, команды "бан <юз>", "разбан <юз>")
-# - Добавлена команда "пополнить <число>" (создаёт инвойс admin_topup:<amount>)
-# - Везде проверка бана перед взаимодействиями (callback/message handlers)
-# - Остальная логика сохранена (подарки, очередь pending_gifts, реальный баланс через get_my_star_balance)
+# Исправление: объединён роутер для текстовых сообщений (админские команды + /стат + /баланс),
+# чтобы /стат корректно обрабатывался в группе (было пересечение нескольких хендлеров).
 
 import asyncio
 import asyncpg
@@ -374,10 +370,6 @@ async def is_banned(user_id: int) -> bool:
 # Helper to get real bot balance via Telegram API
 # --------------------
 async def get_real_bot_stars() -> int:
-    """
-    Use Bot API to fetch real Telegram Stars balance for the bot (getMyStarBalance).
-    Return integer amount or 0 on failure.
-    """
     try:
         bal = await bot.get_my_star_balance()
         amount = 0
@@ -556,7 +548,7 @@ async def increment_referred_play(referred_user: int):
             if GROUP_ID:
                 actor = await get_user_display_short(inviter)
                 try:
-                    await bot.send_message(GROUP_ID, f"{actor}: приглашённый {await get_user_display_short(referred_user)} сыграл пять игр. Теперь у {actor} — 1 верифицированный реферал", parse_mode=ParseMode.HTML)
+                    await bot.send_message(GROUP_ID, f"{actor}: приглашённый {await get_user_display_short(referred_user)} сыграл пять игр. Теперь у {actor} — 1 верифицированный рефе�рал", parse_mode=ParseMode.HTML)
                 except Exception:
                     pass
 
@@ -886,7 +878,7 @@ async def play_callback(call: types.CallbackQuery):
             start_parameter="buyandplay"
         )
         invoice_map[payload] = (chat_id, invoice_msg.chat.id, invoice_msg.message_id)
-        # Note: per request, DO NOT show text "Откройте оплату в личных сообщениях."
+        # Do not show the "откройте в лс" message per user's request
         await call.answer()
     except Exception:
         log.exception("send_invoice failed")
@@ -949,7 +941,6 @@ async def on_successful_payment(message: types.Message):
         return
 
     if payload.startswith("admin_topup:"):
-        # Admin top-up invoice paid
         try:
             parts = payload.split(":")
             if len(parts) >= 2:
@@ -958,12 +949,10 @@ async def on_successful_payment(message: types.Message):
                 amount = 0
         except Exception:
             amount = 0
-        # Telegram will credit the bot automatically. Just confirm.
         try:
             await message.answer(f"✅ Пополнение на {amount}⭐ принято. Спасибо!")
         except Exception:
             pass
-        # Notify group
         if GROUP_ID:
             try:
                 actor = await get_user_display_short(payer_id)
@@ -987,7 +976,6 @@ async def on_successful_payment(message: types.Message):
             pass
         return
 
-    # other payments
     try:
         await message.answer("Платёж принят. Спасибо!")
     except Exception:
@@ -1026,125 +1014,112 @@ async def pay_virtual_cb(call: types.CallbackQuery):
         await call.message.answer("Не удалось создать платёж.")
 
 # --------------------
-# Admin commands: бан, разбан, пополнить
-# These are group-only and require sending from GROUP_ID chat (admins)
+# Unified message router:
+# Handles admin commands (бан/разбан/пополнить) and /стат and /баланс
+# This prevents handler conflicts and ensures /стат работает.
 # --------------------
 @dp.message(F.text)
-async def admin_commands_router(message: types.Message):
+async def unified_text_router(message: types.Message):
     text = (message.text or "").strip()
     if not text:
         return
-    lowered = text.split()[0].lower()
+    lowered_token = text.split()[0].lower()
 
-    # Only allow admin commands in GROUP_ID
-    if message.chat.id != GROUP_ID:
-        return
-
-    # BAN: "бан <user>" or "/бан <user>"
-    if lowered in ("/бан", "бан"):
-        parts = text.split(maxsplit=1)
-        if len(parts) == 1 and message.reply_to_message:
-            # use reply target
-            target = message.reply_to_message.from_user.id
-        elif len(parts) >= 2:
-            token = parts[1].strip()
-            if token.startswith("@"):
-                try:
-                    chat = await bot.get_chat(token)
-                    target = chat.id
-                except Exception:
-                    await message.reply("Не удалось найти пользователя по username.")
+    # ADMIN COMMANDS: only allowed in GROUP_ID
+    if message.chat.id == GROUP_ID:
+        # BAN
+        if lowered_token in ("/бан", "бан"):
+            parts = text.split(maxsplit=1)
+            if len(parts) == 1 and message.reply_to_message:
+                target = message.reply_to_message.from_user.id
+            elif len(parts) >= 2:
+                token = parts[1].strip()
+                if token.startswith("@"):
+                    try:
+                        chat = await bot.get_chat(token)
+                        target = chat.id
+                    except Exception:
+                        await message.reply("Не удалось найти пользователя по username.")
+                        return
+                elif token.lstrip("-").isdigit():
+                    target = int(token)
+                else:
+                    await message.reply("Неверный формат. Используйте: бан <@username|id> или ответьте командой на сообщение пользователя.")
                     return
-            elif token.isdigit():
-                target = int(token)
             else:
-                await message.reply("Неверный формат. Используйте: бан <@username|id> или ответьте командой на сообщение пользователя.")
+                await message.reply("Укажите пользователя для бана: бан <@username|id> или ответьте на сообщение.")
                 return
-        else:
-            await message.reply("Укажите пользователя для бана: бан <@username|id> или ответьте на сообщение.")
+            await ban_user(target)
+            actor = await get_user_display_short(target)
+            await message.reply(f"✅ Пользователь {actor} забанен.", parse_mode=ParseMode.HTML)
             return
-        await ban_user(target)
-        actor = await get_user_display_short(target)
-        await message.reply(f"✅ Пользователь {actor} забанен.", parse_mode=ParseMode.HTML)
-        return
 
-    # UNBAN: "разбан <user>" or "/разбан <user>"
-    if lowered in ("/разбан", "разбан"):
-        parts = text.split(maxsplit=1)
-        if len(parts) == 1 and message.reply_to_message:
-            target = message.reply_to_message.from_user.id
-        elif len(parts) >= 2:
-            token = parts[1].strip()
-            if token.startswith("@"):
-                try:
-                    chat = await bot.get_chat(token)
-                    target = chat.id
-                except Exception:
-                    await message.reply("Не удалось найти пользователя по username.")
+        # UNBAN
+        if lowered_token in ("/разбан", "разбан"):
+            parts = text.split(maxsplit=1)
+            if len(parts) == 1 and message.reply_to_message:
+                target = message.reply_to_message.from_user.id
+            elif len(parts) >= 2:
+                token = parts[1].strip()
+                if token.startswith("@"):
+                    try:
+                        chat = await bot.get_chat(token)
+                        target = chat.id
+                    except Exception:
+                        await message.reply("Не удалось найти пользователя по username.")
+                        return
+                elif token.lstrip("-").isdigit():
+                    target = int(token)
+                else:
+                    await message.reply("Неверный формат. Используйте: разбан <@username|id> или ответьте командой на сообщение пользователя.")
                     return
-            elif token.isdigit():
-                target = int(token)
             else:
-                await message.reply("Неверный формат. Используйте: разбан <@username|id> или ответьте командой на сообщение пользователя.")
+                await message.reply("Укажите пользователя для разбанa: разбан <@username|id> или ответьте на сообщение.")
                 return
-        else:
-            await message.reply("Укажите пользователя для разбанa: разбан <@username|id> или ответьте на сообщение.")
+            await unban_user(target)
+            actor = await get_user_display_short(target)
+            await message.reply(f"✅ Пользователь {actor} разбанен.", parse_mode=ParseMode.HTML)
             return
-        await unban_user(target)
-        actor = await get_user_display_short(target)
-        await message.reply(f"✅ Пользователь {actor} разбанен.", parse_mode=ParseMode.HTML)
-        return
 
-    # TOPUP / пополнить: "пополнить <число>" -> create invoice for admin to pay.
-    if lowered in ("/пополнить", "пополнить"):
-        parts = text.split(maxsplit=1)
-        if len(parts) < 2:
-            await message.reply("Использование: пополнить <число_звёзд>")
-            return
-        try:
-            amount = int(parts[1].strip())
-            if amount <= 0:
-                await message.reply("Сумма должна быть положительным числом.")
+        # TOPUP / пополнить
+        if lowered_token in ("/пополнить", "пополнить"):
+            parts = text.split(maxsplit=1)
+            if len(parts) < 2:
+                await message.reply("Использование: пополнить <число_звёзд>")
                 return
-        except Exception:
-            await message.reply("Неверный формат числа.")
+            try:
+                amount = int(parts[1].strip())
+                if amount <= 0:
+                    await message.reply("Сумма должна быть положительным числом.")
+                    return
+            except Exception:
+                await message.reply("Неверный формат числа.")
+                return
+            admin_id = message.from_user.id
+            prices = [LabeledPrice(label=f"Пополнение бота на {amount}⭐", amount=int(amount * STAR_UNIT_MULTIPLIER))]
+            payload = f"admin_topup:{amount}:{int(time.time())}"
+            try:
+                invoice_msg = await bot.send_invoice(
+                    chat_id=admin_id,
+                    title=f"Пополнение бота — {amount}⭐",
+                    description="Пополнение реального баланса бота звёздами Telegram",
+                    provider_token=PAYMENTS_PROVIDER_TOKEN,
+                    currency="XTR",
+                    prices=prices,
+                    payload=payload,
+                    start_parameter="admintopup"
+                )
+                invoice_map[payload] = (message.chat.id, invoice_msg.chat.id, invoice_msg.message_id)
+                await message.reply("Инвойс создан и отправлен администратору в личку.")
+            except Exception:
+                log.exception("send_invoice failed")
+                await message.reply("Не удалось создать инвойс. Проверьте Payments в BotFather.")
             return
-        # Create invoice to admin (message.from_user.id)
-        admin_id = message.from_user.id
-        prices = [LabeledPrice(label=f"Пополнение бота на {amount}⭐", amount=int(amount * STAR_UNIT_MULTIPLIER))]
-        payload = f"admin_topup:{amount}:{int(time.time())}"
-        try:
-            invoice_msg = await bot.send_invoice(
-                chat_id=admin_id,
-                title=f"Пополнение бота — {amount}⭐",
-                description="Пополнение реального баланса бота звёздами Telegram",
-                provider_token=PAYMENTS_PROVIDER_TOKEN,
-                currency="XTR",
-                prices=prices,
-                payload=payload,
-                start_parameter="admintopup"
-            )
-            invoice_map[payload] = (message.chat.id, invoice_msg.chat.id, invoice_msg.message_id)
-            await message.reply("Инвойс создан и отправлен администратору в личку.")
-        except Exception:
-            log.exception("send_invoice failed")
-            await message.reply("Не удалось создать инвойс. Проверьте Payments в BotFather.")
-        return
 
-    # If it's /стат or /баланс etc, let existing handler handle them (no conflict)
-    # Otherwise ignore here.
+        # /стат and /баланс are also valid in group; fall through to their handlers below
 
-# --------------------
-# Commands: /стат and /баланс (group only)
-# --------------------
-@dp.message(F.text)
-async def stat_and_balans_router(message: types.Message):
-    text = (message.text or "").strip()
-    if not text:
-        return
-    lowered = text.lower().split()[0]
     # /стат
-    if lowered == "/стат" or lowered == "стат":
+    if lowered_token == "/стат" or lowered_token == "стат":
         if GROUP_ID is None or message.chat.id != GROUP_ID:
             return
         try:
@@ -1160,7 +1135,7 @@ async def stat_and_balans_router(message: types.Message):
         return
 
     # /баланс or баланс (group only)
-    if lowered.startswith("/баланс") or lowered == "баланс":
+    if lowered_token.startswith("/баланс") or lowered_token == "баланс":
         if GROUP_ID is None or message.chat.id != GROUP_ID:
             return
         parts = text.split()
@@ -1171,6 +1146,9 @@ async def stat_and_balans_router(message: types.Message):
         # disallow manual DB set
         await message.answer("Управление реальным балансом бота запрещено вручную. Баланс формирует Telegram через платежи.")
         return
+
+    # If none matched, do nothing here (other handlers may handle other message types)
+    return
 
 # --------------------
 # Web server health
