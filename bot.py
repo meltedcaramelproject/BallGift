@@ -1,7 +1,11 @@
 # Полный файл: bot (1).py
-# Изменения: при выигрыше бот пытается прямо отправить реальный Telegram Gift (через getAvailableGifts/sendGift).
-# Если отправка неудачна — fallback в pending_gifts как раньше.
-# Всё остальное сохранено.
+# Внесены правки согласно пожеланиям пользователя:
+# 1) порядок сообщений при выигрыше: (а) результат попаданий, (б) отправка подарка (или очередь), (в) главное меню
+# 2) удалено сообщение "Меню внизу — откройте для быстрого доступа."
+# 3) реферальное уведомление изменено на требуемый формат с кликабельным никнеймом
+# 4) /стат теперь показывает только число пользователей и реальный баланс бота
+# 5) в логах/сообщениях первичен юзернейм, иначе ссылка на профиль
+# 6) сохранение данных в БД — прежняя логика, таблицы созданы при init_db
 
 import asyncio
 import asyncpg
@@ -48,7 +52,7 @@ db_pool: Optional[asyncpg.Pool] = None
 # per-chat lock for running games (to prevent concurrent games in same chat)
 game_locks: dict[int, bool] = {}
 
-# invoice mapping: payload -> (origin_chat_id, invoice_chat_id, message_id) to delete invoice after success
+# invoice mapping: payload -> (origin_chat_id, invoice_chat_id, message_id)
 invoice_map: dict[str, Tuple[int, int, int]] = {}
 
 # Config for buttons: (count, virtual_cost, premium_flag, prefix)
@@ -64,7 +68,6 @@ BUTTONS = {
 
 # Gift real-star costs and premium gifts
 GIFT_VALUES = {"normal": 15, "premium": 25}
-PREMIUM_GIFTS = ["premium_present", "rose"]  # logical labels only; actual selection is by star_count
 
 # For payments: STAR_UNIT_MULTIPLIER = how many smallest currency units equal 1 star.
 # Default 1 means provider returns amount in stars directly.
@@ -306,7 +309,7 @@ async def add_user_earned_real(user_id: int, amount: int):
     bot._mem_users.setdefault(user_id, {"virtual_stars": 0, "free_next_at": 0, "spent_real": 0, "earned_real": 0, "plays_total": 0})["earned_real"] += amount
 
 # --------------------
-# ADDED: pending_gifts helper to insert tasks (for worker)
+# pending_gifts helper to insert tasks (for worker)
 # --------------------
 async def add_pending_gift(user_id: int, amount_stars: int, premium: bool = False):
     if db_pool:
@@ -324,7 +327,7 @@ async def add_pending_gift(user_id: int, amount_stars: int, premium: bool = Fals
     bot._mem_pending_gifts.append({"user_id": user_id, "amount_stars": amount_stars, "premium": premium, "status": "pending", "created_at": int(time.time())})
 
 # --------------------
-# ADDED: bot state helpers (get/change bot stars) - reliable
+# bot state helpers (get/change bot stars)
 # --------------------
 async def get_bot_stars() -> int:
     if db_pool:
@@ -383,7 +386,7 @@ async def set_bot_stars_absolute(value: int) -> int:
     return v
 
 # --------------------
-# ADDED: inc_user_plays helper
+# inc_user_plays helper
 # --------------------
 async def inc_user_plays(user_id: int, cnt: int = 1):
     if db_pool:
@@ -399,43 +402,69 @@ async def inc_user_plays(user_id: int, cnt: int = 1):
     bot._mem_users[user_id]["plays_total"] = bot._mem_users[user_id].get("plays_total", 0) + cnt
 
 # --------------------
-# NEW: try to send a real Telegram gift now (fallback to pending_gifts if fail)
-# Uses Bot API: getAvailableGifts + sendGift (aiogram wrappers).
-# See core docs: getAvailableGifts and sendGift. 3
+# Helpers to get nice actor display (username first, else clickable name)
+# --------------------
+async def get_user_display_short(user_id: int) -> str:
+    """
+    Returns a short display string for use in logs/messages:
+    - If user has username, returns @username
+    - Else returns clickable link to open PM with the user's first name (or id)
+    """
+    try:
+        u = await bot.get_chat(user_id)
+        if getattr(u, "username", None):
+            return f"@{u.username}"
+        name = getattr(u, "first_name", None) or str(user_id)
+        return f'<a href="tg://user?id={user_id}">{name}</a>'
+    except Exception:
+        # fallback to id link
+        return f'<a href="tg://user?id={user_id}">{user_id}</a>'
+
+async def get_user_mention_link(user_id: int) -> str:
+    """
+    Returns a clickable mention for the referred user:
+    - If username exists, shows username and is clickable by username display (we keep @username plain; clicking it opens profile)
+    - Always include a tg://user?id link so that clicking opens PM
+    """
+    try:
+        u = await bot.get_chat(user_id)
+        display = getattr(u, "username", None) or getattr(u, "first_name", None) or str(user_id)
+        return f'<a href="tg://user?id={user_id}">{display}</a>'
+    except Exception:
+        return f'<a href="tg://user?id={user_id}">{user_id}</a>'
+
+# --------------------
+# Try to send a real Telegram gift now (fallback to pending_gifts if fail)
 # --------------------
 async def try_send_real_gift(user_id: int, chat_id: int, amount_stars: int, premium: bool = False) -> bool:
     """
     Attempt to send a real Telegram Gift immediately.
-    Returns True if sent, False if failed (in which case caller may queue pending_gifts).
+    Returns True if sent, False if failed (then caller may queue).
     """
     try:
-        # fetch list of gifts bot can send
+        # getAvailableGifts wrapper in aiogram
         gifts_obj = await bot.get_available_gifts()
         gifts_list = getattr(gifts_obj, "gifts", []) or []
-        # filter by star_count matching required amount
         candidates = [g for g in gifts_list if getattr(g, "star_count", None) == int(amount_stars)]
         if not candidates:
-            # nothing of exact price available: fallback
             log.info("No available gifts matching %s stars (user=%s)", amount_stars, user_id)
             return False
-        # choose random gift
         chosen = random.choice(candidates)
         gift_id = getattr(chosen, "id", None)
         if not gift_id:
             log.warning("Chosen gift has no id, fallback to queue (user=%s)", user_id)
             return False
-        # send gift to user (use user_id or chat_id)
-        # Note: send_gift requires either user_id or chat_id; we'll use user_id where possible
         try:
+            # send_gift returns True/False or raises
             success = await bot.send_gift(gift_id=gift_id, user_id=user_id)
         except Exception as e:
             log.exception("send_gift API error for gift_id=%s user=%s: %s", gift_id, user_id, e)
             success = False
         if success:
             log.info("send_gift succeeded gift_id=%s user=%s", gift_id, user_id)
-            # Optionally inform user (we already send textual confirmation elsewhere)
+            # send small confirmation in chat
             try:
-                await bot.send_message(chat_id, f"🎁 Подарок отправлен — откройте профиль, чтобы увидеть подарок.")
+                await bot.send_message(chat_id, f"🎁 Подарок отправлен — проверьте ваш профиль.")
             except Exception:
                 pass
             return True
@@ -447,26 +476,28 @@ async def try_send_real_gift(user_id: int, chat_id: int, amount_stars: int, prem
         return False
 
 # --------------------
-# Referrals & stats & game flow (unchanged except gift handling uses try_send_real_gift)
+# Referrals & stats & game flow
 # --------------------
 async def register_ref_visit(referred_user: int, inviter: int) -> bool:
+    """
+    Register that referred_user came from inviter link.
+    Send message to inviter in desired format:
+    "🔗 По вашей ссылке перешёл <никнейм_перешедшего_ссылка>. Вы получите +3⭐ после того, как он сыграет 5 игр"
+    """
     if db_pool:
         try:
             async with db_pool.acquire() as conn:
                 res = await conn.execute("INSERT INTO referrals (referred_user, inviter, plays, rewarded) VALUES ($1, $2, 0, FALSE) ON CONFLICT (referred_user) DO NOTHING", referred_user, inviter)
                 if res and res.endswith(" 1"):
+                    mention = await get_user_mention_link(referred_user)
                     try:
-                        u = await bot.get_chat(referred_user)
-                        mention = f"@{u.username}" if getattr(u, "username", None) else (u.first_name or str(referred_user))
-                    except Exception:
-                        mention = str(referred_user)
-                    try:
-                        await bot.send_message(inviter, f"🔗 По вашей ссылке перешёл {mention}\nВы получите <b>+3⭐</b> на баланс после того, как он сыграет 5 раз в баскетбол", parse_mode=ParseMode.HTML)
+                        await bot.send_message(inviter, f"🔗 По вашей ссылке перешёл {mention}. Вы получите +3⭐ после того, как он сыграет 5 игр", parse_mode=ParseMode.HTML)
                     except Exception:
                         pass
                     if GROUP_ID:
+                        actor = await get_user_display_short(inviter)
                         try:
-                            await bot.send_message(GROUP_ID, f"{mention} перешёл по реферальной ссылке к {inviter}")
+                            await bot.send_message(GROUP_ID, f"{actor}: по ссылке перешёл {mention}", parse_mode=ParseMode.HTML)
                         except Exception:
                             pass
                     return True
@@ -474,18 +505,21 @@ async def register_ref_visit(referred_user: int, inviter: int) -> bool:
         except Exception:
             log.exception("register_ref_visit DB failed")
             return False
+    # in-memory fallback
     if not hasattr(bot, "_mem_referrals"):
         bot._mem_referrals = {}
     if referred_user in bot._mem_referrals:
         return False
     bot._mem_referrals[referred_user] = {"inviter": inviter, "plays": 0, "rewarded": False}
+    mention = await get_user_mention_link(referred_user)
     try:
-        await bot.send_message(inviter, f"🔗 По вашей ссылке перешёл пользователь. Вы получите +3⭐ после 5 игр")
+        await bot.send_message(inviter, f"🔗 По вашей ссылке перешёл {mention}. Вы получите +3⭐ после того, как он сыграет 5 игр", parse_mode=ParseMode.HTML)
     except Exception:
         pass
     if GROUP_ID:
+        actor = await get_user_display_short(inviter)
         try:
-            await bot.send_message(GROUP_ID, f"{referred_user} перешёл по реферальной ссылке к {inviter}")
+            await bot.send_message(GROUP_ID, f"{actor}: по ссылке перешёл {mention}", parse_mode=ParseMode.HTML)
         except Exception:
             pass
     return True
@@ -504,14 +538,16 @@ async def increment_referred_play(referred_user: int):
                 if plays >= 5:
                     await conn.execute("UPDATE referrals SET plays=$1, rewarded=TRUE WHERE referred_user=$2", plays, referred_user)
                     await change_user_virtual(inviter, 3)
+                    # send the new message prefixed by inviter display
                     try:
                         await bot.send_message(inviter, "🔥 Вам начислено +3⭐ — приглашённый сыграл 5 раз!")
                     except Exception:
                         pass
                     cnt = await conn.fetchval("SELECT COUNT(*) FROM referrals WHERE inviter=$1 AND rewarded=TRUE", inviter)
                     if GROUP_ID:
+                        actor = await get_user_display_short(inviter)
                         try:
-                            await bot.send_message(GROUP_ID, f"{referred_user} сыграл пять игр. Теперь у {inviter} — {int(cnt or 0)} верифицированных рефералов")
+                            await bot.send_message(GROUP_ID, f"{actor}: приглашённый {await get_user_display_short(referred_user)} сыграл пять игр. Теперь у {actor} — {int(cnt or 0)} верифицированных рефералов", parse_mode=ParseMode.HTML)
                         except Exception:
                             pass
                 else:
@@ -533,8 +569,9 @@ async def increment_referred_play(referred_user: int):
             except Exception:
                 pass
             if GROUP_ID:
+                actor = await get_user_display_short(inviter)
                 try:
-                    await bot.send_message(GROUP_ID, f"{referred_user} сыграл пять игр. Теперь у {inviter} — 1 верифицированный реферал")
+                    await bot.send_message(GROUP_ID, f"{actor}: приглашённый {await get_user_display_short(referred_user)} сыграл пять игр. Теперь у {actor} — 1 верифицированный реферал", parse_mode=ParseMode.HTML)
                 except Exception:
                     pass
 
@@ -559,38 +596,19 @@ async def inc_stats(count: int, premium: bool, win: bool):
         else:
             rec["losses"] += 1
 
-async def get_stats_summary() -> str:
-    lines = []
-    if db_pool:
-        try:
-            async with db_pool.acquire() as conn:
-                users_count = int(await conn.fetchval("SELECT COUNT(*) FROM users") or 0)
-                botstars = int(await conn.fetchval("SELECT value FROM bot_state WHERE key='bot_stars'") or 0)
-                rows = await conn.fetch("SELECT count, premium, wins, losses FROM stats ORDER BY count DESC, premium ASC")
-                lines.append(f"Пользователей в боте: {users_count}")
-                lines.append(f"Реальных звёзд у бота: {botstars}")
-                for r in rows:
-                    cnt = r["count"]
-                    prem = r["premium"]
-                    wins = r["wins"]
-                    losses = r["losses"]
-                    label = f"{cnt}{' (premium)' if prem else ''}"
-                    lines.append(f"{label}: выиграли {wins} | проиграли {losses}")
-                return "\n".join(lines)
-        except Exception:
-            log.exception("get_stats DB failed")
-    users_count = len(getattr(bot, "_mem_users", {}))
-    botstars = getattr(bot, "_mem_bot_stars", 0)
-    lines.append(f"Пользователей в боте: {users_count}")
-    lines.append(f"Реальных звёзд у бота: {botstars}")
-    for (cnt,prem), rec in getattr(bot, "_mem_stats", {}).items():
-        lines.append(f"{cnt}{' (premium)' if prem else ''}: выиграли {rec['wins']} | проиграли {rec['losses']}")
-    return "\n".join(lines)
-
 # --------------------
 # Game flow (wait MIN_WAIT_FROM_LAST_THROW from last throw)
 # --------------------
 async def start_game_flow(chat_id: int, count: int, premium: bool, user_id: int):
+    """
+    Behavior adjusted:
+    - if user wins (all hits): send exactly three messages in order:
+        1) hits summary (e.g. "🎯 Вы попали: 5/5")
+        2) gift message (either "подарок отправлен" or "поставлена в очередь")
+        3) main START_TEXT_TEMPLATE with keyboard
+      No other messages are sent in this branch.
+    - other cases (not full win): existing behaviour for results summary remains.
+    """
     if game_locks.get(chat_id):
         return False, "busy"
     game_locks[chat_id] = True
@@ -606,83 +624,95 @@ async def start_game_flow(chat_id: int, count: int, premium: bool, user_id: int)
             last_send_time = time.monotonic()
             messages.append(msg)
             await asyncio.sleep(0.5)
+
         if last_send_time is None:
             last_send_time = time.monotonic()
         elapsed = time.monotonic() - last_send_time
         wait_for = MIN_WAIT_FROM_LAST_THROW - elapsed
         if wait_for > 0:
             await asyncio.sleep(wait_for)
+
+        # collect results
         hits = 0
         results = []
         for msg in messages:
             v = getattr(getattr(msg, "dice", None), "value", 0)
-            results.append(int(v))
+            try:
+                results.append(int(v))
+            except Exception:
+                results.append(0)
             if int(v) >= 4:
                 hits += 1
+
+        # bookkeeping & stats
         await inc_user_plays(user_id, len(results))
         await increment_referred_play(user_id)
         await inc_stats(count, premium, hits == len(results) and len(results) > 0)
 
-        # award gift if win (all hits)
+        # WIN: all hits
         if len(results) > 0 and hits == len(results):
+            # 1) send hits summary first
+            try:
+                await bot.send_message(chat_id, f"🎯 Вы попали: {hits}/{len(results)}")
+            except Exception:
+                log.exception("Failed to send hits summary to chat %s", chat_id)
+
+            # 2) attempt to send gift (reserve stars first)
             if premium:
                 gift_cost = GIFT_VALUES["premium"]
-                bot_stars_now = await get_bot_stars()
-                log.info("Attempting premium gift: bot_stars=%s, gift_cost=%s (user=%s chat=%s)", bot_stars_now, gift_cost, user_id, chat_id)
-                if bot_stars_now < gift_cost:
-                    await bot.send_message(chat_id, "⚠️ У бота недостаточно звёзд для покупки премиального подарка.")
-                else:
-                    # reserve stars synchronously
-                    await change_bot_stars(-gift_cost)
-                    await add_user_earned_real(user_id, gift_cost)
-                    # try to send actual gift now
-                    sent = await try_send_real_gift(user_id, chat_id, gift_cost, premium=True)
-                    if not sent:
-                        # fallback to queue
-                        await add_pending_gift(user_id, gift_cost, premium=True)
-                        await bot.send_message(chat_id, "🎁 Вы выиграли премиальный подарок — но его нужно купить/отправить вручную. Задача поставлена в очередь.")
-                    else:
-                        # already informed inside try_send_real_gift and/or below
-                        pass
-                    if GROUP_ID:
-                        try:
-                            spent = int(await (db_pool.fetchval("SELECT spent_real FROM users WHERE user_id=$1", user_id) if db_pool else 0) or 0)
-                        except Exception:
-                            spent = 0
-                        try:
-                            await bot.send_message(GROUP_ID, f"<a href=\"tg://user?id={user_id}\">{user_id}</a> выиграл премиальный подарок.\nПотрачено им: {spent}⭐\nЗаработано им: {gift_cost}⭐", parse_mode=ParseMode.HTML)
-                        except Exception:
-                            pass
             else:
                 gift_cost = GIFT_VALUES["normal"]
-                bot_stars_now = await get_bot_stars()
-                log.info("Attempting normal gift: bot_stars=%s, gift_cost=%s (user=%s chat=%s)", bot_stars_now, gift_cost, user_id, chat_id)
-                if bot_stars_now < gift_cost:
-                    await bot.send_message(chat_id, "⚠️ У бота недостаточно звёзд для покупки подарка.")
-                else:
-                    await change_bot_stars(-gift_cost)
-                    await add_user_earned_real(user_id, gift_cost)
-                    # try to send gift immediately (real Telegram Gift)
-                    sent = await try_send_real_gift(user_id, chat_id, gift_cost, premium=False)
-                    if not sent:
-                        # fallback: queue for worker
-                        await add_pending_gift(user_id, gift_cost, premium=False)
-                        await bot.send_message(chat_id, "🎁 Вы выиграли: 🐻 Мишка или 💖 Сердечко — задача покупки/отправки поставлена в очередь.")
-                    else:
-                        # If success, keep the message consistent with previous UX:
-                        # (try_send_real_gift already sent a short confirmation; keep UX)
-                        pass
-                    if GROUP_ID:
-                        try:
-                            spent = int(await (db_pool.fetchval("SELECT spent_real FROM users WHERE user_id=$1", user_id) if db_pool else 0) or 0)
-                        except Exception:
-                            spent = 0
-                        try:
-                            await bot.send_message(GROUP_ID, f"<a href=\"tg://user?id={user_id}\">{user_id}</a> выиграл подарок.\nПотрачено им: {spent}⭐\nЗаработано им: {gift_cost}⭐", parse_mode=ParseMode.HTML)
-                        except Exception:
-                            pass
 
-        # results summary
+            bot_stars_now = await get_bot_stars()
+            log.info("Win: bot_stars=%s, needed=%s, user=%s", bot_stars_now, gift_cost, user_id)
+
+            if bot_stars_now < gift_cost:
+                # Not enough real stars -> we still treat this as 'gift step' but queue purchase
+                await add_user_earned_real(user_id, gift_cost)
+                await add_pending_gift(user_id, gift_cost, premium=premium)
+                try:
+                    await bot.send_message(chat_id, "🎁 Вы выиграли подарок — его покупка/отправка поставлена в очередь.")
+                except Exception:
+                    log.exception("Failed to send queued gift message to chat %s", chat_id)
+            else:
+                # Reserve stars (atomically)
+                await change_bot_stars(-gift_cost)
+                await add_user_earned_real(user_id, gift_cost)
+                # Try immediate send
+                sent = await try_send_real_gift(user_id, chat_id, gift_cost, premium=premium)
+                if not sent:
+                    # fallback queue
+                    await add_pending_gift(user_id, gift_cost, premium=premium)
+                    try:
+                        await bot.send_message(chat_id, "🎁 Вы выиграли подарок — его покупка/отправка поставлена в очередь.")
+                    except Exception:
+                        log.exception("Failed to send queued gift message to chat %s", chat_id)
+                else:
+                    # try_send_real_gift sends a short confirmation itself; if you prefer a custom message,
+                    # you can uncomment the next lines — currently we keep what try_send_real_gift did.
+                    pass
+
+            # send log to GROUP_ID (if configured) prefixed by actor display
+            if GROUP_ID:
+                try:
+                    actor = await get_user_display_short(user_id)
+                    try:
+                        await bot.send_message(GROUP_ID, f"{actor}: выиграл подарок ({gift_cost}⭐).", parse_mode=ParseMode.HTML)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+
+            # 3) send main menu immediately
+            try:
+                vnow = await get_user_virtual(user_id)
+                await bot.send_message(chat_id, START_TEXT_TEMPLATE.format(virtual_stars=vnow), reply_markup=build_main_keyboard(user_id))
+            except Exception:
+                log.exception("Failed to send main menu to chat %s", chat_id)
+
+            return True, "win"
+
+        # NON-WIN: keep original summary flow (results + follow-ups + menu)
         text_lines = ["🎯 <b>Результаты бросков:</b>\n"]
         if results:
             for v in results:
@@ -696,7 +726,7 @@ async def start_game_flow(chat_id: int, count: int, premium: bool, user_id: int)
 
         await asyncio.sleep(1)
         try:
-            await bot.send_message(chat_id, "✅ ПОПАДАНИЕ!" if len(results)>0 and hits==len(results) else "🟡 Не все попали. Попробуем ещё?")
+            await bot.send_message(chat_id, "✅ ПОПАДАНИЕ!" if len(results) > 0 and hits == len(results) else "🟡 Не все попали. Попробуем ещё?")
         except Exception:
             log.exception("Failed to send follow-up to chat %s", chat_id)
 
@@ -722,9 +752,14 @@ async def cmd_start(message: types.Message):
     try:
         mention = f"<a href=\"tg://user?id={uid}\">{user.first_name or uid}</a>"
         if GROUP_ID:
-            await bot.send_message(GROUP_ID, f"{mention} перешёл в бота", parse_mode=ParseMode.HTML)
+            actor = await get_user_display_short(uid)
+            try:
+                await bot.send_message(GROUP_ID, f"{actor} перешёл в бота", parse_mode=ParseMode.HTML)
+            except Exception:
+                pass
     except Exception:
         pass
+    # handle payload (ref)
     payload = ""
     try:
         txt = (message.text or "").strip()
@@ -743,8 +778,8 @@ async def cmd_start(message: types.Message):
     v = await get_user_virtual(uid)
     start_text = START_TEXT_TEMPLATE.format(virtual_stars=v)
     try:
+        # send only the START_TEXT_TEMPLATE (removed the "Меню внизу..." message)
         await message.answer(start_text, reply_markup=build_main_keyboard(uid))
-        await message.answer("Меню внизу — откройте для быстрого доступа.", reply_markup=REPLY_MENU)
     except Exception:
         pass
 
@@ -966,12 +1001,26 @@ async def stat_and_balans_router(message: types.Message):
     if not text:
         return
     lowered = text.lower().split()[0]
+    # /стат
     if lowered == "/стат" or lowered == "стат":
         if GROUP_ID is None or message.chat.id != GROUP_ID:
             return
-        summary = await get_stats_summary()
-        await message.answer(summary)
+        # Return exactly the required format
+        try:
+            # number of users
+            if db_pool:
+                async with db_pool.acquire() as conn:
+                    users_count = int(await conn.fetchval("SELECT COUNT(*) FROM users") or 0)
+                    botstars = int(await conn.fetchval("SELECT value FROM bot_state WHERE key='bot_stars'") or 0)
+            else:
+                users_count = len(getattr(bot, "_mem_users", {}))
+                botstars = getattr(bot, "_mem_bot_stars", 0)
+            await message.answer(f"👤 Пользователей: {users_count}\n⭐ Звёзд на счету бота: {botstars}")
+        except Exception:
+            log.exception("Failed to produce /стат")
         return
+
+    # /баланс or баланс (kept original admin behavior)
     if lowered.startswith("/баланс") or lowered == "баланс":
         if GROUP_ID is None or message.chat.id != GROUP_ID:
             return
