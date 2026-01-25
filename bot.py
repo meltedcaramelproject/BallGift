@@ -1,11 +1,11 @@
 # Полный файл: bot (1).py
-# Внесены правки согласно пожеланиям пользователя:
-# 1) порядок сообщений при выигрыше: (а) результат попаданий, (б) отправка подарка (или очередь), (в) главное меню
-# 2) удалено сообщение "Меню внизу — откройте для быстрого доступа."
-# 3) реферальное уведомление изменено на требуемый формат с кликабельным никнеймом
-# 4) /стат теперь показывает только число пользователей и реальный баланс бота
-# 5) в логах/сообщениях первичен юзернейм, иначе ссылка на профиль
-# 6) сохранение данных в БД — прежняя логика, таблицы созданы при init_db
+# Изменения:
+# - убрана логика хранения/изменения баланса бота в БД;
+# - /стат показывает реальный баланс бота через get_my_star_balance();
+# - после каждой игры отправляется сводное сообщение в GROUP_ID в нужном формате;
+# - start_game_flow получил paid_real_amount параметр (сколько реальных звёзд заплатил игрок для этой игры);
+# - при попытке отправить подарок используем send_gift; если не удалось — добавляем в pending_gifts;
+# - все пользовательские данные по-прежнему сохраняются в БД (users, referrals, pending_gifts и пр.).
 
 import asyncio
 import asyncpg
@@ -66,7 +66,7 @@ BUTTONS = {
     "prem1": (1, 15, True, "💎") # premium single ball 15⭐ (label "мяч")
 }
 
-# Gift real-star costs and premium gifts
+# Gift real-star costs
 GIFT_VALUES = {"normal": 15, "premium": 25}
 
 # For payments: STAR_UNIT_MULTIPLIER = how many smallest currency units equal 1 star.
@@ -171,6 +171,7 @@ async def init_db():
                     rewarded BOOLEAN NOT NULL DEFAULT FALSE
                 )
             """)
+            # keep bot_state table for compatibility but we won't use it for real balance
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS bot_state (
                     key TEXT PRIMARY KEY,
@@ -196,6 +197,7 @@ async def init_db():
                     created_at TIMESTAMP WITH TIME ZONE DEFAULT now()
                 )
             """)
+            # initialize bot_state row for backward compatibility (unused for real balance)
             await conn.execute("INSERT INTO bot_state (key, value) VALUES ('bot_stars', 0) ON CONFLICT (key) DO NOTHING")
             for c, prem in [(1, False), (2, False), (3, False), (4, False), (5, False), (6, False), (1, True)]:
                 await conn.execute("INSERT INTO stats (count, premium, wins, losses) VALUES ($1,$2,0,0) ON CONFLICT (count,premium) DO NOTHING", c, prem)
@@ -327,63 +329,32 @@ async def add_pending_gift(user_id: int, amount_stars: int, premium: bool = Fals
     bot._mem_pending_gifts.append({"user_id": user_id, "amount_stars": amount_stars, "premium": premium, "status": "pending", "created_at": int(time.time())})
 
 # --------------------
-# bot state helpers (get/change bot stars)
+# Helper to get real bot balance via Telegram API
 # --------------------
-async def get_bot_stars() -> int:
-    if db_pool:
-        try:
-            async with db_pool.acquire() as conn:
-                val = await conn.fetchval("SELECT value FROM bot_state WHERE key='bot_stars'")
-                val_int = int(val or 0)
-                bot._mem_bot_stars = val_int
-                log.debug("get_bot_stars (db) -> %s", val_int)
-                return val_int
-        except Exception:
-            log.exception("get_bot_stars DB failed")
-    val = getattr(bot, "_mem_bot_stars", 0)
-    log.debug("get_bot_stars (mem) -> %s", val)
-    return int(val or 0)
-
-async def change_bot_stars(delta: int) -> int:
-    if db_pool:
-        try:
-            async with db_pool.acquire() as conn:
-                await conn.execute("INSERT INTO bot_state (key, value) VALUES ('bot_stars', 0) ON CONFLICT (key) DO NOTHING")
-                row = await conn.fetchrow("UPDATE bot_state SET value = GREATEST(value + $1, 0) WHERE key='bot_stars' RETURNING value", delta)
-                if row and "value" in row:
-                    newval = int(row["value"])
-                    bot._mem_bot_stars = newval
-                    log.debug("change_bot_stars (db) delta=%s -> %s", delta, newval)
-                    return newval
-                val = await conn.fetchval("SELECT value FROM bot_state WHERE key='bot_stars'")
-                newval = int(val or 0)
-                bot._mem_bot_stars = newval
-                log.debug("change_bot_stars (db fallback) delta=%s -> %s", delta, newval)
-                return newval
-        except Exception:
-            log.exception("change_bot_stars DB failed")
-    current = getattr(bot, "_mem_bot_stars", 0)
-    new = max(int(current) + int(delta), 0)
-    bot._mem_bot_stars = new
-    log.debug("change_bot_stars (mem) delta=%s -> %s", delta, new)
-    return new
-
-async def set_bot_stars_absolute(value: int) -> int:
-    v = max(int(value), 0)
-    if db_pool:
-        try:
-            async with db_pool.acquire() as conn:
-                await conn.execute("INSERT INTO bot_state (key, value) VALUES ('bot_stars', $1) ON CONFLICT (key) DO UPDATE SET value=$1", v)
-                val = await conn.fetchval("SELECT value FROM bot_state WHERE key='bot_stars'")
-                newval = int(val or 0)
-                bot._mem_bot_stars = newval
-                log.debug("set_bot_stars_absolute (db) -> %s", newval)
-                return newval
-        except Exception:
-            log.exception("set_bot_stars_absolute DB failed")
-    bot._mem_bot_stars = v
-    log.debug("set_bot_stars_absolute (mem) -> %s", v)
-    return v
+async def get_real_bot_stars() -> int:
+    """
+    Use Bot API to fetch real Telegram Stars balance for the bot (getMyStarBalance).
+    Return integer amount or 0 on failure.
+    """
+    try:
+        bal = await bot.get_my_star_balance()
+        # aiogram may return an object with attribute 'amount' (or 'total_amount'), safely extract
+        amount = 0
+        if hasattr(bal, "amount"):
+            amount = getattr(bal, "amount") or 0
+        elif hasattr(bal, "total_amount"):
+            amount = getattr(bal, "total_amount") or 0
+        else:
+            # if bal is a dict-like
+            try:
+                amount = int(bal.get("amount", 0))
+            except Exception:
+                amount = 0
+        return int(amount or 0)
+    except Exception:
+        log.exception("get_my_star_balance failed")
+        # fallback to 0 or stored mem
+        return int(getattr(bot, "_mem_bot_stars", 0) or 0)
 
 # --------------------
 # inc_user_plays helper
@@ -423,8 +394,6 @@ async def get_user_display_short(user_id: int) -> str:
 async def get_user_mention_link(user_id: int) -> str:
     """
     Returns a clickable mention for the referred user:
-    - If username exists, shows username and is clickable by username display (we keep @username plain; clicking it opens profile)
-    - Always include a tg://user?id link so that clicking opens PM
     """
     try:
         u = await bot.get_chat(user_id)
@@ -439,10 +408,10 @@ async def get_user_mention_link(user_id: int) -> str:
 async def try_send_real_gift(user_id: int, chat_id: int, amount_stars: int, premium: bool = False) -> bool:
     """
     Attempt to send a real Telegram Gift immediately.
-    Returns True if sent, False if failed (then caller may queue).
+    Returns True if sent, False if failed (in which case caller will queue pending_gifts).
+    Note: we do not adjust any DB balance; Telegram itself will deduct stars on successful send.
     """
     try:
-        # getAvailableGifts wrapper in aiogram
         gifts_obj = await bot.get_available_gifts()
         gifts_list = getattr(gifts_obj, "gifts", []) or []
         candidates = [g for g in gifts_list if getattr(g, "star_count", None) == int(amount_stars)]
@@ -455,14 +424,12 @@ async def try_send_real_gift(user_id: int, chat_id: int, amount_stars: int, prem
             log.warning("Chosen gift has no id, fallback to queue (user=%s)", user_id)
             return False
         try:
-            # send_gift returns True/False or raises
             success = await bot.send_gift(gift_id=gift_id, user_id=user_id)
         except Exception as e:
             log.exception("send_gift API error for gift_id=%s user=%s: %s", gift_id, user_id, e)
             success = False
         if success:
             log.info("send_gift succeeded gift_id=%s user=%s", gift_id, user_id)
-            # send small confirmation in chat
             try:
                 await bot.send_message(chat_id, f"🎁 Подарок отправлен — проверьте ваш профиль.")
             except Exception:
@@ -481,7 +448,7 @@ async def try_send_real_gift(user_id: int, chat_id: int, amount_stars: int, prem
 async def register_ref_visit(referred_user: int, inviter: int) -> bool:
     """
     Register that referred_user came from inviter link.
-    Send message to inviter in desired format:
+    Send message to inviter in required format:
     "🔗 По вашей ссылке перешёл <никнейм_перешедшего_ссылка>. Вы получите +3⭐ после того, как он сыграет 5 игр"
     """
     if db_pool:
@@ -538,7 +505,6 @@ async def increment_referred_play(referred_user: int):
                 if plays >= 5:
                     await conn.execute("UPDATE referrals SET plays=$1, rewarded=TRUE WHERE referred_user=$2", plays, referred_user)
                     await change_user_virtual(inviter, 3)
-                    # send the new message prefixed by inviter display
                     try:
                         await bot.send_message(inviter, "🔥 Вам начислено +3⭐ — приглашённый сыграл 5 раз!")
                     except Exception:
@@ -599,15 +565,9 @@ async def inc_stats(count: int, premium: bool, win: bool):
 # --------------------
 # Game flow (wait MIN_WAIT_FROM_LAST_THROW from last throw)
 # --------------------
-async def start_game_flow(chat_id: int, count: int, premium: bool, user_id: int):
+async def start_game_flow(chat_id: int, count: int, premium: bool, user_id: int, paid_real_amount: int = 0):
     """
-    Behavior adjusted:
-    - if user wins (all hits): send exactly three messages in order:
-        1) hits summary (e.g. "🎯 Вы попали: 5/5")
-        2) gift message (either "подарок отправлен" or "поставлена в очередь")
-        3) main START_TEXT_TEMPLATE with keyboard
-      No other messages are sent in this branch.
-    - other cases (not full win): existing behaviour for results summary remains.
+    paid_real_amount: how many real Telegram stars the player paid for this game (0 if not paid via invoice)
     """
     if game_locks.get(chat_id):
         return False, "busy"
@@ -624,7 +584,6 @@ async def start_game_flow(chat_id: int, count: int, premium: bool, user_id: int)
             last_send_time = time.monotonic()
             messages.append(msg)
             await asyncio.sleep(0.5)
-
         if last_send_time is None:
             last_send_time = time.monotonic()
         elapsed = time.monotonic() - last_send_time
@@ -632,7 +591,6 @@ async def start_game_flow(chat_id: int, count: int, premium: bool, user_id: int)
         if wait_for > 0:
             await asyncio.sleep(wait_for)
 
-        # collect results
         hits = 0
         results = []
         for msg in messages:
@@ -644,64 +602,50 @@ async def start_game_flow(chat_id: int, count: int, premium: bool, user_id: int)
             if int(v) >= 4:
                 hits += 1
 
-        # bookkeeping & stats
         await inc_user_plays(user_id, len(results))
         await increment_referred_play(user_id)
         await inc_stats(count, premium, hits == len(results) and len(results) > 0)
 
-        # WIN: all hits
-        if len(results) > 0 and hits == len(results):
-            # 1) send hits summary first
+        # Determine win/loss and proceed
+        win = len(results) > 0 and hits == len(results)
+        won_amount = 0
+        spent_real = paid_real_amount or 0  # amount the user actually paid with Telegram stars for this game
+
+        if win:
+            # 1) send hits summary first (exact)
             try:
                 await bot.send_message(chat_id, f"🎯 Вы попали: {hits}/{len(results)}")
             except Exception:
                 log.exception("Failed to send hits summary to chat %s", chat_id)
 
-            # 2) attempt to send gift (reserve stars first)
-            if premium:
-                gift_cost = GIFT_VALUES["premium"]
-            else:
-                gift_cost = GIFT_VALUES["normal"]
-
-            bot_stars_now = await get_bot_stars()
-            log.info("Win: bot_stars=%s, needed=%s, user=%s", bot_stars_now, gift_cost, user_id)
-
-            if bot_stars_now < gift_cost:
-                # Not enough real stars -> we still treat this as 'gift step' but queue purchase
-                await add_user_earned_real(user_id, gift_cost)
-                await add_pending_gift(user_id, gift_cost, premium=premium)
-                try:
-                    await bot.send_message(chat_id, "🎁 Вы выиграли подарок — его покупка/отправка поставлена в очередь.")
-                except Exception:
-                    log.exception("Failed to send queued gift message to chat %s", chat_id)
-            else:
-                # Reserve stars (atomically)
-                await change_bot_stars(-gift_cost)
-                await add_user_earned_real(user_id, gift_cost)
-                # Try immediate send
+            # 2) Attempt to send real gift
+            gift_cost = GIFT_VALUES["premium"] if premium else GIFT_VALUES["normal"]
+            # Check real bot balance
+            bot_balance_before = await get_real_bot_stars()
+            # Try to send gift if balance sufficient (prefer immediate send)
+            if bot_balance_before >= gift_cost:
                 sent = await try_send_real_gift(user_id, chat_id, gift_cost, premium=premium)
-                if not sent:
-                    # fallback queue
+                if sent:
+                    won_amount = gift_cost
+                else:
+                    # fallback: queue task (user still won)
                     await add_pending_gift(user_id, gift_cost, premium=premium)
+                    won_amount = gift_cost
                     try:
                         await bot.send_message(chat_id, "🎁 Вы выиграли подарок — его покупка/отправка поставлена в очередь.")
                     except Exception:
                         log.exception("Failed to send queued gift message to chat %s", chat_id)
-                else:
-                    # try_send_real_gift sends a short confirmation itself; if you prefer a custom message,
-                    # you can uncomment the next lines — currently we keep what try_send_real_gift did.
-                    pass
-
-            # send log to GROUP_ID (if configured) prefixed by actor display
-            if GROUP_ID:
+            else:
+                # Not enough stars now -> queue gift
+                await add_pending_gift(user_id, gift_cost, premium=premium)
+                won_amount = gift_cost
                 try:
-                    actor = await get_user_display_short(user_id)
-                    try:
-                        await bot.send_message(GROUP_ID, f"{actor}: выиграл подарок ({gift_cost}⭐).", parse_mode=ParseMode.HTML)
-                    except Exception:
-                        pass
+                    await bot.send_message(chat_id, "🎁 Вы выиграли подарок — его покупка/отправка поставлена в очередь.")
                 except Exception:
-                    pass
+                    log.exception("Failed to send queued gift message to chat %s", chat_id)
+
+            # Get current bot balance AFTER attempted send (to show accurate remainder)
+            bot_balance_after = await get_real_bot_stars()
 
             # 3) send main menu immediately
             try:
@@ -710,34 +654,58 @@ async def start_game_flow(chat_id: int, count: int, premium: bool, user_id: int)
             except Exception:
                 log.exception("Failed to send main menu to chat %s", chat_id)
 
-            return True, "win"
-
-        # NON-WIN: keep original summary flow (results + follow-ups + menu)
-        text_lines = ["🎯 <b>Результаты бросков:</b>\n"]
-        if results:
-            for v in results:
-                text_lines.append("✅ Попал" if v >= 4 else "❌ Промах")
         else:
-            text_lines.append("⚠️ Не удалось отправить ни одного мяча.")
-        try:
-            await bot.send_message(chat_id, "\n".join(text_lines))
-        except Exception:
-            log.exception("Failed to send results summary to chat %s", chat_id)
+            # Non-win: prepare results messages as before
+            text_lines = ["🎯 <b>Результаты бросков:</b>\n"]
+            if results:
+                for v in results:
+                    text_lines.append("✅ Попал" if v >= 4 else "❌ Промах")
+            else:
+                text_lines.append("⚠️ Не удалось отправить ни одного мяча.")
+            try:
+                await bot.send_message(chat_id, "\n".join(text_lines))
+            except Exception:
+                log.exception("Failed to send results summary to chat %s", chat_id)
 
-        await asyncio.sleep(1)
-        try:
-            await bot.send_message(chat_id, "✅ ПОПАДАНИЕ!" if len(results) > 0 and hits == len(results) else "🟡 Не все попали. Попробуем ещё?")
-        except Exception:
-            log.exception("Failed to send follow-up to chat %s", chat_id)
+            await asyncio.sleep(1)
+            try:
+                await bot.send_message(chat_id, "✅ ПОПАДАНИЕ!" if len(results)>0 and hits==len(results) else "🟡 Не все попали. Попробуем ещё?")
+            except Exception:
+                log.exception("Failed to send follow-up to chat %s", chat_id)
 
-        await asyncio.sleep(1)
-        try:
-            vnow = await get_user_virtual(user_id)
-            await bot.send_message(chat_id, START_TEXT_TEMPLATE.format(virtual_stars=vnow), reply_markup=build_main_keyboard(user_id))
-        except Exception:
-            log.exception("Failed to send main menu to chat %s", chat_id)
+            # For losses, no gift. spent_real already holds real amount paid (0 or >0)
+            won_amount = 0
+            bot_balance_after = await get_real_bot_stars()
 
-        return True, "ok"
+            await asyncio.sleep(1)
+            try:
+                vnow = await get_user_virtual(user_id)
+                await bot.send_message(chat_id, START_TEXT_TEMPLATE.format(virtual_stars=vnow), reply_markup=build_main_keyboard(user_id))
+            except Exception:
+                log.exception("Failed to send main menu to chat %s", chat_id)
+
+        # Send required structured message to GROUP_ID if configured
+        if GROUP_ID:
+            try:
+                actor = await get_user_display_short(user_id)
+                emoji = "🎁" if win else "🥺"
+                verb = "выиграл" if win else "проиграл"
+                # spent_real: only show the real Telegram-stars the user paid; if they used free or internal virtual, it's 0
+                # (we rely on paid_real_amount parameter)
+                spent_display = int(spent_real or 0)
+                won_display = int(won_amount or 0)
+                msg = (
+                    f"{emoji} Пользователь {actor} {verb}\n\n"
+                    f"Бросков: {len(results)}🏀\n"
+                    f"Он потратил: {spent_display}⭐\n"
+                    f"Он выиграл: {won_display}⭐\n"
+                    f"Остаток баланса бота: {int(bot_balance_after)}⭐"
+                )
+                await bot.send_message(GROUP_ID, msg, parse_mode=ParseMode.HTML)
+            except Exception:
+                log.exception("Failed to send group summary to GROUP_ID")
+
+        return True, "win" if win else "ok"
     finally:
         game_locks.pop(chat_id, None)
 
@@ -750,16 +718,14 @@ async def cmd_start(message: types.Message):
     uid = user.id
     await ensure_user(uid)
     try:
-        mention = f"<a href=\"tg://user?id={uid}\">{user.first_name or uid}</a>"
+        actor = await get_user_display_short(uid)
         if GROUP_ID:
-            actor = await get_user_display_short(uid)
             try:
                 await bot.send_message(GROUP_ID, f"{actor} перешёл в бота", parse_mode=ParseMode.HTML)
             except Exception:
                 pass
     except Exception:
         pass
-    # handle payload (ref)
     payload = ""
     try:
         txt = (message.text or "").strip()
@@ -778,7 +744,7 @@ async def cmd_start(message: types.Message):
     v = await get_user_virtual(uid)
     start_text = START_TEXT_TEMPLATE.format(virtual_stars=v)
     try:
-        # send only the START_TEXT_TEMPLATE (removed the "Меню внизу..." message)
+        # Send only the START_TEXT_TEMPLATE (removed "Меню внизу ..." message)
         await message.answer(start_text, reply_markup=build_main_keyboard(uid))
     except Exception:
         pass
@@ -853,18 +819,19 @@ async def play_callback(call: types.CallbackQuery):
             return
         await set_user_free_next(user_id, now + FREE_COOLDOWN)
         await call.answer()
-        await start_game_flow(chat_id, cnt, premium, user_id)
+        # free game -> paid_real_amount = 0
+        await start_game_flow(chat_id, cnt, premium, user_id, paid_real_amount=0)
         return
 
     vstars = await get_user_virtual(user_id)
     if vstars >= cost:
+        # user pays with internal virtual stars (not Telegram real stars) -> we DO NOT change Telegram balance
         await change_user_virtual(user_id, -cost)
-        # user paid virtual stars -> bot earns 'cost' stars
-        await change_bot_stars(cost)
         await call.answer()
-        await start_game_flow(chat_id, cnt, premium, user_id)
+        await start_game_flow(chat_id, cnt, premium, user_id, paid_real_amount=0)
         return
 
+    # missing real stars => request invoice (user will pay via provider -> real Telegram stars to bot)
     missing = cost - vstars
     noun = word_form_mяч(cnt)
     title = f"{cnt} {noun}"
@@ -935,17 +902,19 @@ async def on_successful_payment(message: types.Message):
         except Exception:
             paid_stars = paid_amount_raw
         log.info("Payment accepted: raw=%s -> stars=%s (mult=%s) payer=%s", paid_amount_raw, paid_stars, STAR_UNIT_MULTIPLIER, payer_id)
+        # IMPORTANT: do NOT try to modify DB balance for bot; Telegram will credit bot automatically.
+        # Record user's spent_real in DB for bookkeeping
         if paid_stars > 0:
-            await change_bot_stars(paid_stars)
             await add_user_spent_real(payer_id, paid_stars)
         await set_user_virtual(payer_id, 0)
+        # Start game and pass paid_real_amount so game flow knows user paid real stars
         if game_locks.get(origin_chat_id):
             try:
                 await bot.send_message(payer_id, "Сейчас идёт другая игра в этом чате — ваша оплата зачислена, игра начнётся позже.")
             except Exception:
                 pass
             return
-        await start_game_flow(origin_chat_id, cnt, bool(prem_flag), payer_id)
+        await start_game_flow(origin_chat_id, cnt, bool(prem_flag), payer_id, paid_real_amount=int(paid_stars))
         return
     if payload.startswith("buy_virtual_"):
         try:
@@ -953,7 +922,6 @@ async def on_successful_payment(message: types.Message):
             target_user = int(parts[2])
             missing = int(parts[3])
             await change_user_virtual(target_user, missing)
-            await change_bot_stars(missing)
             await add_user_spent_real(target_user, missing)
             try:
                 await bot.send_message(target_user, f"Оплата принята — вам начислено {missing}⭐.")
@@ -1003,65 +971,34 @@ async def stat_and_balans_router(message: types.Message):
     lowered = text.lower().split()[0]
     # /стат
     if lowered == "/стат" or lowered == "стат":
+        # If in group only (as before)
         if GROUP_ID is None or message.chat.id != GROUP_ID:
             return
-        # Return exactly the required format
         try:
             # number of users
             if db_pool:
                 async with db_pool.acquire() as conn:
                     users_count = int(await conn.fetchval("SELECT COUNT(*) FROM users") or 0)
-                    botstars = int(await conn.fetchval("SELECT value FROM bot_state WHERE key='bot_stars'") or 0)
             else:
                 users_count = len(getattr(bot, "_mem_users", {}))
-                botstars = getattr(bot, "_mem_bot_stars", 0)
+            # real Telegram balance:
+            botstars = await get_real_bot_stars()
             await message.answer(f"👤 Пользователей: {users_count}\n⭐ Звёзд на счету бота: {botstars}")
         except Exception:
             log.exception("Failed to produce /стат")
         return
 
-    # /баланс or баланс (kept original admin behavior)
+    # /баланс or баланс (admin only remains, but now shows real balance; setting disabled)
     if lowered.startswith("/баланс") or lowered == "баланс":
         if GROUP_ID is None or message.chat.id != GROUP_ID:
             return
         parts = text.split()
         if len(parts) == 1:
-            b = await get_bot_stars()
+            b = await get_real_bot_stars()
             await message.answer(f"💰 Баланс бота (реальные звёзд): <b>{b}</b>")
             return
-        if len(parts) == 2 and parts[1].lstrip("-").isdigit():
-            amount = int(parts[1])
-            newval = await set_bot_stars_absolute(amount)
-            await message.answer(f"Баланс бота (реальные звёзд) установлен: <b>{newval}</b>")
-            return
-        if len(parts) >= 3:
-            user_token = parts[1]
-            amount_token = parts[2]
-            target_id = None
-            if user_token.lstrip("-").isdigit():
-                target_id = int(user_token)
-            elif user_token.startswith("@"):
-                try:
-                    chat = await bot.get_chat(user_token)
-                    target_id = chat.id
-                except Exception:
-                    await message.answer("Не удалось найти пользователя.")
-                    return
-            else:
-                try:
-                    chat = await bot.get_chat(user_token)
-                    target_id = chat.id
-                except Exception:
-                    await message.answer("Не удалось найти пользователя.")
-                    return
-            if not amount_token.lstrip("-").isdigit():
-                await message.answer("Неверный формат числа.")
-                return
-            amount = int(amount_token)
-            await set_user_virtual(target_id, amount)
-            await message.answer(f"Баланс пользователя {target_id} установлен: <b>{amount}⭐</b>")
-            return
-        await message.answer("Использование: баланс OR баланс <число> OR баланс <user> <amount> — только в группе.")
+        # Do not allow manual setting of bot balance (removed DB logic)
+        await message.answer("Управление реальным балансом бота запрещено вручную. Баланс формирует Telegram через платежи.")
         return
 
 # --------------------
