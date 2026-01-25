@@ -14,7 +14,7 @@ from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 from aiogram.types import (
     InlineKeyboardMarkup, InlineKeyboardButton,
-    ReplyKeyboardMarkup, KeyboardButton, LabeledPrice, ContentType, PreCheckoutQuery
+    ReplyKeyboardMarkup, KeyboardButton, LabeledPrice, ContentType, WebAppInfo, PreCheckoutQuery
 )
 from aiogram.filters import CommandStart
 
@@ -29,6 +29,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 GROUP_ID_RAW = os.getenv("GROUP_ID", "")
 PAYMENTS_PROVIDER_TOKEN = os.getenv("PAYMENTS_PROVIDER_TOKEN", "")
 ADMIN_ID = os.getenv("ADMIN_ID")
+PUBLIC_URL = os.getenv("PUBLIC_URL", "")  # optional
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
@@ -39,6 +40,18 @@ try:
         GROUP_ID = int(GROUP_ID_RAW)
 except Exception:
     GROUP_ID = None
+
+# -------------- sanity check: InlineKeyboardButton(copy_text=...) support --------------
+# Try to construct a test button with types.CopyTextButton. If pydantic/aiogram doesn't accept it,
+# raise a clear error so you can upgrade aiogram.
+try:
+    _ = InlineKeyboardButton(text="test-copy", copy_text=types.CopyTextButton(text="t"))
+except Exception as e:
+    raise RuntimeError(
+        "Your aiogram/pydantic installation does not accept InlineKeyboardButton(copy_text=...). "
+        "Upgrade aiogram/pydantic in your environment (e.g. `pip install -U aiogram asyncpg aiohttp pydantic`)."
+        f"\nOriginal error: {e}"
+    )
 
 # --------------------
 # Bot & Dispatcher
@@ -72,7 +85,7 @@ BUTTONS = {
 GIFT_VALUES = {"normal": 15, "premium": 25}
 PREMIUM_GIFTS = ["premium_present", "rose"]
 
-# For payments: smallest currency unit multiplier (adjust for provider)
+# For XTR: 1 star -> amount=1 (currency smallest unit; adjust if needed)
 STAR_UNIT_MULTIPLIER = 1
 
 # Free cooldown seconds
@@ -115,11 +128,9 @@ START_TEXT_TEMPLATE = (
     "💰 Баланс: <b>{virtual_stars}</b>"
 )
 
-REF_TEXT_PLAIN = (
-    "**+3⭐ ЗА ДРУГА**\n\n"
-    "Получай +3⭐ на баланс за каждого приглашённого пользователя!\n\n"
-    "**🔗 Ваша ссылка**\n"
-    "`{link}`"
+REF_TEXT_HTML = (
+    "<b>+3⭐ ЗА ДРУГА</b>\n\n"
+    "Получай +3⭐ на баланс за каждого приглашённого пользователя!"
 )
 
 REPLY_MENU = ReplyKeyboardMarkup(
@@ -130,9 +141,7 @@ REPLY_MENU = ReplyKeyboardMarkup(
 
 def build_ref_keyboard_with_link(user_id: int, bot_username: str) -> InlineKeyboardMarkup:
     """
-    Returns markup with:
-    - "➡️ Отправить другу" -> t.me share URL
-    - "◀️ Назад" -> back to main
+    STRICT: create native copy_text button using types.CopyTextButton(text=link)
     """
     if bot_username:
         link = f"https://t.me/{bot_username}?start={user_id}"
@@ -143,6 +152,9 @@ def build_ref_keyboard_with_link(user_id: int, bot_username: str) -> InlineKeybo
 
     kb_rows = []
     kb_rows.append([InlineKeyboardButton(text="➡️ Отправить другу", url=share_url)])
+    # Native copy_text via types.CopyTextButton
+    btn_copy = InlineKeyboardButton(text="Скопировать ссылку", copy_text=types.CopyTextButton(text=link))
+    kb_rows.append([btn_copy])
     kb_rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="ref_back")])
     return InlineKeyboardMarkup(inline_keyboard=kb_rows)
 
@@ -252,7 +264,7 @@ async def set_user_virtual(user_id: int, value: int) -> int:
     if not hasattr(bot, "_mem_users"):
         bot._mem_users = {}
     bot._mem_users.setdefault(user_id, {"virtual_stars": 0, "free_next_at": 0, "spent_real": 0, "earned_real": 0, "plays_total": 0})["virtual_stars"] = max(value, 0)
-    return bot._mem_bot_stars if hasattr(bot, "_mem_bot_stars") else value
+    return bot._mem_users[user_id]["virtual_stars"]
 
 async def get_user_free_next(user_id: int) -> int:
     await ensure_user(user_id)
@@ -355,7 +367,7 @@ async def set_bot_stars_absolute(value: int) -> int:
     return bot._mem_bot_stars
 
 # --------------------
-# Referrals & stats & game flow (same as before)
+# Referrals & stats & game flow (unchanged logic)
 # --------------------
 async def register_ref_visit(referred_user: int, inviter: int) -> bool:
     if db_pool:
@@ -640,19 +652,10 @@ async def ref_menu(call: types.CallbackQuery):
         bot_username = me.username or ""
     except Exception:
         bot_username = ""
-    if bot_username:
-        link = f"https://t.me/{bot_username}?start={uid}"
-    else:
-        link = f"/start {uid}"
-    # build text exactly as user requested (raw text with backticks)
-    text = "**+3⭐ ЗА ДРУГА**\n\n" \
-           "Получай +3⭐ на баланс за каждого приглашённого пользователя!\n\n" \
-           "**🔗 Ваша ссылка**\n" \
-           f"`{link}`"
     try:
-        await call.message.edit_text(text, reply_markup=build_ref_keyboard_with_link(uid, bot_username), parse_mode=None)
+        await call.message.edit_text(REF_TEXT_HTML, reply_markup=build_ref_keyboard_with_link(uid, bot_username), parse_mode=ParseMode.HTML)
     except Exception:
-        await call.message.answer(text, reply_markup=build_ref_keyboard_with_link(uid, bot_username), parse_mode=None)
+        await call.message.answer(REF_TEXT_HTML, reply_markup=build_ref_keyboard_with_link(uid, bot_username), parse_mode=ParseMode.HTML)
 
 @dp.callback_query(F.data == "ref_back")
 async def ref_back(call: types.CallbackQuery):
@@ -665,7 +668,8 @@ async def ref_back(call: types.CallbackQuery):
         await call.message.answer(START_TEXT_TEMPLATE.format(virtual_stars=v), reply_markup=build_main_keyboard(uid), parse_mode=ParseMode.HTML)
 
 # --------------------
-# Play/payment/stat/balance handlers (same as earlier)
+# Play/payment/stat/balance handlers
+# (exact same logic as earlier full file)
 # --------------------
 @dp.callback_query(F.data and F.data.startswith("play_"))
 async def play_callback(call: types.CallbackQuery):
