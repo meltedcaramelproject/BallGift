@@ -1,6 +1,8 @@
 # Полный файл: bot (1).py
-# (я включаю весь файл целиком — это ваш существующий код + минимальные вставки для очереди pending_gifts)
-# Источник: ваш проект (bot (1).py). 1
+# Внимание: в файл внесена минимальная правка, возвращающая поведение после оплаты.
+# FIXED: invoice_map теперь хранит (origin_chat_id, invoice_chat_id, invoice_msg_id)
+# FIXED: on_successful_payment использует origin_chat_id для старта игры (вместо payer_id)
+# Всё остальное оставлено без изменений.
 
 import asyncio
 import asyncpg
@@ -45,8 +47,9 @@ db_pool: Optional[asyncpg.Pool] = None
 # per-chat lock for running games (to prevent concurrent games in same chat)
 game_locks: dict[int, bool] = {}
 
-# invoice mapping: payload -> (chat_id, message_id) to delete invoice after success
-invoice_map: dict[str, Tuple[int, int]] = {}
+# invoice mapping: payload -> (origin_chat_id, invoice_chat_id, message_id) to delete invoice after success
+# FIXED: store origin_chat_id so we can resume game in original chat after payment
+invoice_map: dict[str, Tuple[int, int, int]] = {}
 
 # Config for buttons: (count, virtual_cost, premium_flag, prefix)
 BUTTONS = {
@@ -696,6 +699,7 @@ async def play_callback(call: types.CallbackQuery):
     ts = int(time.time())
     payload = f"buy_and_play:{user_id}:{cnt}:{1 if premium else 0}:{ts}"
     try:
+        # invoice is sent to user private chat
         invoice_msg = await bot.send_invoice(
             chat_id=user_id,
             title=title,
@@ -706,7 +710,8 @@ async def play_callback(call: types.CallbackQuery):
             payload=payload,
             start_parameter="buyandplay"
         )
-        invoice_map[payload] = (invoice_msg.chat.id, invoice_msg.message_id)
+        # FIXED: Save origin chat id so that after payment we start the game in the original chat
+        invoice_map[payload] = (chat_id, invoice_msg.chat.id, invoice_msg.message_id)
         await call.answer("Откройте оплату в личных сообщениях.", show_alert=False)
     except Exception:
         log.exception("send_invoice failed")
@@ -721,6 +726,7 @@ async def on_successful_payment(message: types.Message):
     sp = message.successful_payment
     payload = getattr(sp, "invoice_payload", "") or ""
     payer_id = message.from_user.id
+    # FIXED: use origin_chat_id stored in invoice_map to resume game in correct chat
     if payload.startswith("buy_and_play:"):
         try:
             parts = payload.split(":")
@@ -737,13 +743,17 @@ async def on_successful_payment(message: types.Message):
         try:
             mapping = invoice_map.pop(payload, None)
             if mapping:
-                inv_chat_id, inv_msg_id = mapping
+                origin_chat_id, inv_chat_id, inv_msg_id = mapping
                 try:
                     await bot.delete_message(inv_chat_id, inv_msg_id)
                 except Exception:
                     log.exception("Failed to delete invoice message")
+            else:
+                # fallback: if no mapping, assume start in user's private chat
+                origin_chat_id = payer_id
         except Exception:
             log.exception("invoice_map delete error")
+            origin_chat_id = payer_id
         try:
             paid_amount = int(sp.total_amount or 0)
         except Exception:
@@ -752,10 +762,11 @@ async def on_successful_payment(message: types.Message):
             await change_bot_stars(paid_amount)
             await add_user_spent_real(payer_id, paid_amount)
         await set_user_virtual(payer_id, 0)
-        if game_locks.get(payer_id):
+        # If there's a game running in origin chat, notify user; otherwise start game in origin_chat_id
+        if game_locks.get(origin_chat_id):
             await bot.send_message(payer_id, "Сейчас идёт другая игра в этом чате — ваша оплата зачислена, игра начнётся позже.")
             return
-        await start_game_flow(payer_id, cnt, bool(prem_flag), payer_id)
+        await start_game_flow(origin_chat_id, cnt, bool(prem_flag), payer_id)
         return
     if payload.startswith("buy_virtual_"):
         try:
@@ -797,7 +808,8 @@ async def pay_virtual_cb(call: types.CallbackQuery):
             payload=payload,
             start_parameter="buyvirtual"
         )
-        invoice_map[payload] = (invoice_msg.chat.id, invoice_msg.message_id)
+        # store origin chat as user's private chat (since initiated from there)
+        invoice_map[payload] = (user.id, invoice_msg.chat.id, invoice_msg.message_id)
     except Exception:
         log.exception("send_invoice failed")
         await call.message.answer("Не удалось создать платёж.")
