@@ -1,10 +1,6 @@
 # Полный файл: bot (1).py
-# Изменения:
-# - referrals table теперь содержит plays_left INT DEFAULT 5
-# - register_ref_visit ставит plays_left=5 при создании
-# - increment_referred_play уменьшает plays_left, увеличивает plays,
-#   и при plays_left == 0 помечает rewarded = TRUE и начисляет +3⭐ приглашавшему
-# - в in-memory fallback добавлены аналоги полей plays_left и rewarded
+# Изменения: при достижении 5 сыгранных игр рефералом — приглашавшему начисляются +3⭐ на внутренний баланс (virtual_stars).
+# Все остальное сохранено.
 
 import asyncio
 import asyncpg
@@ -162,7 +158,7 @@ async def init_db():
                     plays_total BIGINT NOT NULL DEFAULT 0
                 )
             """)
-            # Modified referrals: add plays_left DEFAULT 5 to persist how many plays remain
+            # referrals now stores plays_left so we can track how many plays left until reward
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS referrals (
                     referred_user BIGINT PRIMARY KEY,
@@ -172,7 +168,6 @@ async def init_db():
                     rewarded BOOLEAN NOT NULL DEFAULT FALSE
                 )
             """)
-            # keep bot_state table for compatibility but we won't use it for real balance
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS bot_state (
                     key TEXT PRIMARY KEY,
@@ -481,11 +476,10 @@ async def register_ref_visit(referred_user: int, inviter: int) -> bool:
                     "INSERT INTO referrals (referred_user, inviter, plays, plays_left, rewarded) VALUES ($1, $2, 0, 5, FALSE) ON CONFLICT (referred_user) DO NOTHING",
                     referred_user, inviter
                 )
-                # if inserted, res ends with "INSERT 0 1" or similar; check for insertion
                 if res and res.endswith(" 1"):
                     mention = await get_user_mention_link(referred_user)
                     try:
-                        await bot.send_message(inviter, f"🔗 По вашей ссылке перешёл {mention}. Вы получите +3⭐ после того, как он сыграет 5 игр", parse_mode=ParseMode.HTML)
+                        await bot.send_message(inviter, f"🔗 По вашей ссылке перешёл {mention}. Вы получите +3⭐ на баланс в боте после того, как он сыграет 5 игр", parse_mode=ParseMode.HTML)
                     except Exception:
                         pass
                     if GROUP_ID:
@@ -507,7 +501,7 @@ async def register_ref_visit(referred_user: int, inviter: int) -> bool:
     bot._mem_referrals[referred_user] = {"inviter": inviter, "plays": 0, "plays_left": 5, "rewarded": False}
     mention = await get_user_mention_link(referred_user)
     try:
-        await bot.send_message(inviter, f"🔗 По вашей ссылке перешёл {mention}. Вы получите +3⭐ после того, как он сыграет 5 игр", parse_mode=ParseMode.HTML)
+        await bot.send_message(inviter, f"🔗 По вашей ссылке перешёл {mention}. Вы получите +3⭐ на баланс в боте после того, как он сыграет 5 игр", parse_mode=ParseMode.HTML)
     except Exception:
         pass
     if GROUP_ID:
@@ -522,7 +516,7 @@ async def increment_referred_play(referred_user: int):
     """
     Called when a referred_user plays one game.
     Reduces plays_left by 1 and increments plays.
-    When plays_left reaches 0, marks rewarded and gives inviter +3⭐ (once).
+    When plays_left reaches 0, marks rewarded and gives inviter +3⭐ (once) on internal bot balance.
     """
     if db_pool:
         try:
@@ -536,12 +530,12 @@ async def increment_referred_play(referred_user: int):
                 plays += 1
                 plays_left = max(plays_left - 1, 0)
                 if plays_left <= 0:
-                    # reward inviter
+                    # reward inviter once: set rewarded TRUE and credit +3 to inviter internal balance
                     await conn.execute("UPDATE referrals SET plays=$1, plays_left=$2, rewarded=TRUE WHERE referred_user=$3", plays, plays_left, referred_user)
-                    # credit inviter with 3 virtual stars
+                    # credit inviter with 3 virtual stars (internal balance)
                     await change_user_virtual(inviter, 3)
                     try:
-                        await bot.send_message(inviter, "🔥 Вам начислено +3⭐ — приглашённый сыграл 5 раз!")
+                        await bot.send_message(inviter, "🔥 Вам начислено +3⭐ на баланс в боте — приглашённый сыграл 5 раз!")
                     except Exception:
                         pass
                     # notify group
@@ -549,7 +543,7 @@ async def increment_referred_play(referred_user: int):
                         try:
                             actor = await get_user_display_short(inviter)
                             mention = await get_user_mention_link(referred_user)
-                            await bot.send_message(GROUP_ID, f"{actor}: приглашённый {mention} сыграл пять игр и был засчитан. +3⭐ начислено.", parse_mode=ParseMode.HTML)
+                            await bot.send_message(GROUP_ID, f"{actor}: приглашённый {mention} сыграл пять игр и был засчитан. +3⭐ на баланс в боте начислено.", parse_mode=ParseMode.HTML)
                         except Exception:
                             pass
                 else:
@@ -568,14 +562,14 @@ async def increment_referred_play(referred_user: int):
             inviter = rec["inviter"]
             await change_user_virtual(inviter, 3)
             try:
-                await bot.send_message(inviter, "🔥 Вам начислено +3⭐ — приглашённый сыграл 5 раз!")
+                await bot.send_message(inviter, "🔥 Вам начислено +3⭐ на баланс в боте — приглашённый сыграл 5 раз!")
             except Exception:
                 pass
             if GROUP_ID:
                 try:
                     actor = await get_user_display_short(inviter)
                     mention = await get_user_mention_link(referred_user)
-                    await bot.send_message(GROUP_ID, f"{actor}: приглашённый {mention} сыграл пять игр и был засчитан. +3⭐ начислено.", parse_mode=ParseMode.HTML)
+                    await bot.send_message(GROUP_ID, f"{actor}: приглашённый {mention} сыграл пять игр и был засчитан. +3⭐ на баланс в боте начислено.", parse_mode=ParseMode.HTML)
                 except Exception:
                     pass
 
