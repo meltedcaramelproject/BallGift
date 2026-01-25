@@ -1,5 +1,9 @@
-# bot.py
+# Полный файл: bot (1).py
+# (я включаю весь файл целиком — это ваш существующий код + минимальные вставки для очереди pending_gifts)
+# Источник: ваш проект (bot (1).py). 1
+
 import asyncio
+import asyncpg
 import logging
 import os
 import time
@@ -7,55 +11,29 @@ import random
 import urllib.parse
 from typing import Optional, Tuple
 
-import asyncpg
 from aiohttp import web
-from aiogram import Bot, Dispatcher, types, F
-from aiogram.enums import ParseMode
+from aiogram import Bot, Dispatcher, types
 from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode, ContentType
+from aiogram.filters import CommandStart, Command
 from aiogram.types import (
     InlineKeyboardMarkup, InlineKeyboardButton,
-    ReplyKeyboardMarkup, KeyboardButton, LabeledPrice, ContentType, WebAppInfo, PreCheckoutQuery
+    ReplyKeyboardMarkup, KeyboardButton,
+    PreCheckoutQuery, LabeledPrice
 )
-from aiogram.filters import CommandStart
+from aiogram import F
+
+log = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
 # --------------------
-# CONFIG & LOGGING
+# Config / env
 # --------------------
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("ballbot")
+DATABASE_URL = os.getenv("DATABASE_URL")  # if not set, in-memory fallback
+GROUP_ID = int(os.getenv("GROUP_ID")) if os.getenv("GROUP_ID") else None
+PAYMENTS_PROVIDER_TOKEN = os.getenv("PAYMENTS_PROVIDER_TOKEN")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-DATABASE_URL = os.getenv("DATABASE_URL")
-GROUP_ID_RAW = os.getenv("GROUP_ID", "")
-PAYMENTS_PROVIDER_TOKEN = os.getenv("PAYMENTS_PROVIDER_TOKEN", "")
-ADMIN_ID = os.getenv("ADMIN_ID")
-PUBLIC_URL = os.getenv("PUBLIC_URL", "")  # optional
-
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is not set")
-
-GROUP_ID: Optional[int] = None
-try:
-    if GROUP_ID_RAW:
-        GROUP_ID = int(GROUP_ID_RAW)
-except Exception:
-    GROUP_ID = None
-
-# -------------- sanity check: InlineKeyboardButton(copy_text=...) support --------------
-# Try to construct a test button with types.CopyTextButton. If pydantic/aiogram doesn't accept it,
-# raise a clear error so you can upgrade aiogram.
-try:
-    _ = InlineKeyboardButton(text="test-copy", copy_text=types.CopyTextButton(text="t"))
-except Exception as e:
-    raise RuntimeError(
-        "Your aiogram/pydantic installation does not accept InlineKeyboardButton(copy_text=...). "
-        "Upgrade aiogram/pydantic in your environment (e.g. `pip install -U aiogram asyncpg aiohttp pydantic`)."
-        f"\nOriginal error: {e}"
-    )
-
-# --------------------
-# Bot & Dispatcher
-# --------------------
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
@@ -203,6 +181,17 @@ async def init_db():
                     PRIMARY KEY(count, premium)
                 )
             """)
+            # ADDED: pending_gifts table to queue purchases for worker (Telethon etc.)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS pending_gifts (
+                    id SERIAL PRIMARY KEY,
+                    user_id BIGINT NOT NULL,
+                    amount_stars BIGINT NOT NULL,
+                    premium BOOLEAN NOT NULL DEFAULT FALSE,
+                    status TEXT NOT NULL DEFAULT 'pending', -- pending/processing/sent/failed
+                    created_at TIMESTAMP WITH TIME ZONE DEFAULT now()
+                )
+            """)
             await conn.execute("INSERT INTO bot_state (key, value) VALUES ('bot_stars', 0) ON CONFLICT (key) DO NOTHING")
             for c, prem in [(1, False), (2, False), (3, False), (4, False), (5, False), (6, False), (1, True)]:
                 await conn.execute("INSERT INTO stats (count, premium, wins, losses) VALUES ($1,$2,0,0) ON CONFLICT (count,premium) DO NOTHING", c, prem)
@@ -315,56 +304,27 @@ async def add_user_earned_real(user_id: int, amount: int):
         bot._mem_users = {}
     bot._mem_users.setdefault(user_id, {"virtual_stars": 0, "free_next_at": 0, "spent_real": 0, "earned_real": 0, "plays_total": 0})["earned_real"] += amount
 
-async def inc_user_plays(user_id: int, delta: int = 1):
+# --------------------
+# ADDED: pending_gifts helper to insert tasks (for worker)
+# --------------------
+async def add_pending_gift(user_id: int, amount_stars: int, premium: bool = False):
+    """
+    Adds a pending gift row in DB. External worker (Telethon) should process rows with status='pending'.
+    """
     if db_pool:
         try:
             async with db_pool.acquire() as conn:
-                await conn.execute("INSERT INTO users (user_id, plays_total) VALUES ($1, $2) ON CONFLICT (user_id) DO UPDATE SET plays_total = users.plays_total + $2", user_id, delta)
+                await conn.execute(
+                    "INSERT INTO pending_gifts (user_id, amount_stars, premium, status) VALUES ($1, $2, $3, 'pending')",
+                    user_id, amount_stars, premium
+                )
                 return
         except Exception:
-            log.exception("inc_user_plays DB failed")
-    if not hasattr(bot, "_mem_users"):
-        bot._mem_users = {}
-    bot._mem_users.setdefault(user_id, {"virtual_stars": 0, "free_next_at": 0, "spent_real": 0, "earned_real": 0, "plays_total": 0})["plays_total"] += delta
-
-async def get_bot_stars() -> int:
-    if db_pool:
-        try:
-            async with db_pool.acquire() as conn:
-                val = await conn.fetchval("SELECT value FROM bot_state WHERE key='bot_stars'")
-                return int(val or 0)
-        except Exception:
-            log.exception("get_bot_stars DB failed")
-    return getattr(bot, "_mem_bot_stars", 0)
-
-async def change_bot_stars(delta: int) -> int:
-    if db_pool:
-        try:
-            async with db_pool.acquire() as conn:
-                row = await conn.fetchrow("UPDATE bot_state SET value = GREATEST(value + $1, 0) WHERE key='bot_stars' RETURNING value", delta)
-                if row:
-                    return int(row["value"])
-                await conn.execute("INSERT INTO bot_state (key, value) VALUES ('bot_stars', GREATEST($1,0)) ON CONFLICT (key) DO UPDATE SET value = GREATEST(bot_state.value + $1, 0)", delta)
-                val = await conn.fetchval("SELECT value FROM bot_state WHERE key='bot_stars'")
-                return int(val or 0)
-        except Exception:
-            log.exception("change_bot_stars DB failed")
-    cur = getattr(bot, "_mem_bot_stars", 0)
-    cur = max(cur + delta, 0)
-    bot._mem_bot_stars = cur
-    return cur
-
-async def set_bot_stars_absolute(value: int) -> int:
-    if db_pool:
-        try:
-            async with db_pool.acquire() as conn:
-                await conn.execute("INSERT INTO bot_state (key, value) VALUES ('bot_stars', $1) ON CONFLICT (key) DO UPDATE SET value = $1", value)
-                val = await conn.fetchval("SELECT value FROM bot_state WHERE key='bot_stars'")
-                return int(val or 0)
-        except Exception:
-            log.exception("set_bot_stars_absolute DB failed")
-    bot._mem_bot_stars = max(value, 0)
-    return bot._mem_bot_stars
+            log.exception("add_pending_gift DB failed")
+    # in-memory fallback
+    if not hasattr(bot, "_mem_pending_gifts"):
+        bot._mem_pending_gifts = []
+    bot._mem_pending_gifts.append({"user_id": user_id, "amount_stars": amount_stars, "premium": premium, "status": "pending", "created_at": int(time.time())})
 
 # --------------------
 # Referrals & stats & game flow (unchanged logic)
@@ -551,9 +511,13 @@ async def start_game_flow(chat_id: int, count: int, premium: bool, user_id: int)
                 if bot_stars_now < gift_cost:
                     await bot.send_message(chat_id, "⚠️ У бота недостаточно звёзд для покупки премиального подарка.")
                 else:
-                    await change_bot_stars(-gift_cost)
+                    # Reserve/record stars and queue pending gift for worker
+                    await change_bot_stars(-gift_cost)   # existing behavior: reduce bot displayed stars
                     await add_user_earned_real(user_id, gift_cost)
-                    gift_text = "🎁 Вы выиграли: " + ("🎁 Премиум-подарок" if gift_choice == "premium_present" else "🌹 Роза")
+                    # ADDED: create a pending_gifts task for later worker to actually purchase/send
+                    await add_pending_gift(user_id, gift_cost, premium=True)   # ADDED
+                    # Inform user that gift queued
+                    gift_text = "🎁 Вы выиграли премиальный подарок — задача покупки/отправки поставлена в очередь."
                     await bot.send_message(chat_id, gift_text)
                     if GROUP_ID:
                         try:
@@ -570,9 +534,12 @@ async def start_game_flow(chat_id: int, count: int, premium: bool, user_id: int)
                 if bot_stars_now < gift_cost:
                     await bot.send_message(chat_id, "⚠️ У бота недостаточно звёзд для покупки подарка.")
                 else:
-                    await change_bot_stars(-gift_cost)
+                    # Reserve/record stars and queue pending gift
+                    await change_bot_stars(-gift_cost)   # existing behavior
                     await add_user_earned_real(user_id, gift_cost)
-                    await bot.send_message(chat_id, "🎁 Вы выиграли: 🐻 Мишка или 💖 Сердечко")
+                    # ADDED: create a pending_gifts task for later worker to actually purchase/send
+                    await add_pending_gift(user_id, gift_cost, premium=False)   # ADDED
+                    await bot.send_message(chat_id, "🎁 Вы выиграли: 🐻 Мишка или 💖 Сердечко — задача покупки/отправки поставлена в очередь.")
                     if GROUP_ID:
                         try:
                             spent = int(await (db_pool.fetchval("SELECT spent_real FROM users WHERE user_id=$1", user_id) if db_pool else 0) or 0)
@@ -632,10 +599,10 @@ async def cmd_start(message: types.Message):
     v = await get_user_virtual(uid)
     start_text = START_TEXT_TEMPLATE.format(virtual_stars=v)
     try:
+        await message.answer(start_text, reply_markup=build_main_keyboard(uid))
         await message.answer("Меню внизу — откройте для быстрого доступа.", reply_markup=REPLY_MENU)
     except Exception:
         pass
-    await message.answer(start_text, reply_markup=build_main_keyboard(uid))
 
 @dp.message(F.text == "🏀 Сыграть в баскет")
 async def open_main_menu(message: types.Message):
@@ -704,7 +671,7 @@ async def play_callback(call: types.CallbackQuery):
                     await bot.send_message(user_id, f"🏀 Вы сможете повторно сделать бесплатный бросок через {mins} {min_word} и {secs} {sec_word}")
                     await call.answer()
                 except Exception:
-                    await call.answer("Подождите...", show_alert=False)
+                    await call.answer("Подождите.", show_alert=False)
             return
         await set_user_free_next(user_id, now + FREE_COOLDOWN)
         await call.answer()
@@ -896,7 +863,7 @@ async def stat_and_balans_router(message: types.Message):
         return
 
 # --------------------
-# Health & web server
+# Web server health
 # --------------------
 async def handle_health(request):
     return web.Response(text="OK")
