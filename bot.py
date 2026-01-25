@@ -1,5 +1,8 @@
-# full file: bot (1).py
-# Внесены минимальные правки: FIXED/ADDED (см. комментарии)
+# Полный файл: bot (1).py
+# Изменения: при выигрыше бот пытается прямо отправить реальный Telegram Gift (через getAvailableGifts/sendGift).
+# Если отправка неудачна — fallback в pending_gifts как раньше.
+# Всё остальное сохранено.
+
 import asyncio
 import asyncpg
 import logging
@@ -7,7 +10,7 @@ import os
 import time
 import random
 import urllib.parse
-from typing import Optional, Tuple, Any
+from typing import Optional, Tuple, Any, List
 
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types
@@ -46,7 +49,6 @@ db_pool: Optional[asyncpg.Pool] = None
 game_locks: dict[int, bool] = {}
 
 # invoice mapping: payload -> (origin_chat_id, invoice_chat_id, message_id) to delete invoice after success
-# FIXED: store origin chat id so we can resume game in original chat after payment
 invoice_map: dict[str, Tuple[int, int, int]] = {}
 
 # Config for buttons: (count, virtual_cost, premium_flag, prefix)
@@ -62,9 +64,10 @@ BUTTONS = {
 
 # Gift real-star costs and premium gifts
 GIFT_VALUES = {"normal": 15, "premium": 25}
-PREMIUM_GIFTS = ["premium_present", "rose"]
+PREMIUM_GIFTS = ["premium_present", "rose"]  # logical labels only; actual selection is by star_count
 
-# For XTR: 1 star -> amount=1 (currency smallest unit; adjust if needed)
+# For payments: STAR_UNIT_MULTIPLIER = how many smallest currency units equal 1 star.
+# Default 1 means provider returns amount in stars directly.
 STAR_UNIT_MULTIPLIER = 1
 
 # Free cooldown seconds
@@ -119,24 +122,18 @@ REPLY_MENU = ReplyKeyboardMarkup(
 )
 
 def build_ref_keyboard_with_link(user_id: int, bot_username: str) -> InlineKeyboardMarkup:
-    """
-    STRICT: create native copy_text button using types.CopyTextButton(text=link)
-    """
     if bot_username:
         link = f"https://t.me/{bot_username}?start={user_id}"
     else:
         link = f"/start {user_id}"
     share_text = f"🏀 Приглашаю тебя сыграть в баскет за подарки!\n{link}"
     share_url = f"https://t.me/share/url?text={urllib.parse.quote(share_text)}"
-
     kb_rows = []
     kb_rows.append([InlineKeyboardButton(text="➡️ Отправить другу", url=share_url)])
-    # Native copy_text via types.CopyTextButton if available
     try:
         btn_copy = InlineKeyboardButton(text="Скопировать ссылку", copy_text=types.CopyTextButton(text=link))
         kb_rows.append([btn_copy])
     except Exception:
-        # fallback: provide simple button to open share url
         kb_rows.append([InlineKeyboardButton(text="Скопировать ссылку", url=share_url)])
     kb_rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="ref_back")])
     return InlineKeyboardMarkup(inline_keyboard=kb_rows)
@@ -186,7 +183,6 @@ async def init_db():
                     PRIMARY KEY(count, premium)
                 )
             """)
-            # ADDED: pending_gifts table to queue purchases for worker (Telethon etc.)
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS pending_gifts (
                     id SERIAL PRIMARY KEY,
@@ -313,9 +309,6 @@ async def add_user_earned_real(user_id: int, amount: int):
 # ADDED: pending_gifts helper to insert tasks (for worker)
 # --------------------
 async def add_pending_gift(user_id: int, amount_stars: int, premium: bool = False):
-    """
-    Adds a pending gift row in DB. External worker (Telethon) should process rows with status='pending'.
-    """
     if db_pool:
         try:
             async with db_pool.acquire() as conn:
@@ -326,54 +319,68 @@ async def add_pending_gift(user_id: int, amount_stars: int, premium: bool = Fals
                 return
         except Exception:
             log.exception("add_pending_gift DB failed")
-    # in-memory fallback
     if not hasattr(bot, "_mem_pending_gifts"):
         bot._mem_pending_gifts = []
     bot._mem_pending_gifts.append({"user_id": user_id, "amount_stars": amount_stars, "premium": premium, "status": "pending", "created_at": int(time.time())})
 
 # --------------------
-# ADDED: bot state helpers (get/change bot stars)
+# ADDED: bot state helpers (get/change bot stars) - reliable
 # --------------------
 async def get_bot_stars() -> int:
     if db_pool:
         try:
             async with db_pool.acquire() as conn:
                 val = await conn.fetchval("SELECT value FROM bot_state WHERE key='bot_stars'")
-                return int(val or 0)
+                val_int = int(val or 0)
+                bot._mem_bot_stars = val_int
+                log.debug("get_bot_stars (db) -> %s", val_int)
+                return val_int
         except Exception:
             log.exception("get_bot_stars DB failed")
-    return getattr(bot, "_mem_bot_stars", 0)
+    val = getattr(bot, "_mem_bot_stars", 0)
+    log.debug("get_bot_stars (mem) -> %s", val)
+    return int(val or 0)
 
 async def change_bot_stars(delta: int) -> int:
-    """
-    Atomically change bot_stars by delta (can be negative). Return new value.
-    """
     if db_pool:
         try:
             async with db_pool.acquire() as conn:
-                # upsert if missing
                 await conn.execute("INSERT INTO bot_state (key, value) VALUES ('bot_stars', 0) ON CONFLICT (key) DO NOTHING")
                 row = await conn.fetchrow("UPDATE bot_state SET value = GREATEST(value + $1, 0) WHERE key='bot_stars' RETURNING value", delta)
-                if row:
-                    return int(row["value"])
+                if row and "value" in row:
+                    newval = int(row["value"])
+                    bot._mem_bot_stars = newval
+                    log.debug("change_bot_stars (db) delta=%s -> %s", delta, newval)
+                    return newval
                 val = await conn.fetchval("SELECT value FROM bot_state WHERE key='bot_stars'")
-                return int(val or 0)
+                newval = int(val or 0)
+                bot._mem_bot_stars = newval
+                log.debug("change_bot_stars (db fallback) delta=%s -> %s", delta, newval)
+                return newval
         except Exception:
             log.exception("change_bot_stars DB failed")
-    bot._mem_bot_stars = max(getattr(bot, "_mem_bot_stars", 0) + delta, 0)
-    return bot._mem_bot_stars
+    current = getattr(bot, "_mem_bot_stars", 0)
+    new = max(int(current) + int(delta), 0)
+    bot._mem_bot_stars = new
+    log.debug("change_bot_stars (mem) delta=%s -> %s", delta, new)
+    return new
 
 async def set_bot_stars_absolute(value: int) -> int:
+    v = max(int(value), 0)
     if db_pool:
         try:
             async with db_pool.acquire() as conn:
-                await conn.execute("INSERT INTO bot_state (key, value) VALUES ('bot_stars', $1) ON CONFLICT (key) DO UPDATE SET value=$1", value)
+                await conn.execute("INSERT INTO bot_state (key, value) VALUES ('bot_stars', $1) ON CONFLICT (key) DO UPDATE SET value=$1", v)
                 val = await conn.fetchval("SELECT value FROM bot_state WHERE key='bot_stars'")
-                return int(val or 0)
+                newval = int(val or 0)
+                bot._mem_bot_stars = newval
+                log.debug("set_bot_stars_absolute (db) -> %s", newval)
+                return newval
         except Exception:
             log.exception("set_bot_stars_absolute DB failed")
-    bot._mem_bot_stars = max(int(value), 0)
-    return bot._mem_bot_stars
+    bot._mem_bot_stars = v
+    log.debug("set_bot_stars_absolute (mem) -> %s", v)
+    return v
 
 # --------------------
 # ADDED: inc_user_plays helper
@@ -392,7 +399,55 @@ async def inc_user_plays(user_id: int, cnt: int = 1):
     bot._mem_users[user_id]["plays_total"] = bot._mem_users[user_id].get("plays_total", 0) + cnt
 
 # --------------------
-# Referrals & stats & game flow (unchanged logic)
+# NEW: try to send a real Telegram gift now (fallback to pending_gifts if fail)
+# Uses Bot API: getAvailableGifts + sendGift (aiogram wrappers).
+# See core docs: getAvailableGifts and sendGift. 3
+# --------------------
+async def try_send_real_gift(user_id: int, chat_id: int, amount_stars: int, premium: bool = False) -> bool:
+    """
+    Attempt to send a real Telegram Gift immediately.
+    Returns True if sent, False if failed (in which case caller may queue pending_gifts).
+    """
+    try:
+        # fetch list of gifts bot can send
+        gifts_obj = await bot.get_available_gifts()
+        gifts_list = getattr(gifts_obj, "gifts", []) or []
+        # filter by star_count matching required amount
+        candidates = [g for g in gifts_list if getattr(g, "star_count", None) == int(amount_stars)]
+        if not candidates:
+            # nothing of exact price available: fallback
+            log.info("No available gifts matching %s stars (user=%s)", amount_stars, user_id)
+            return False
+        # choose random gift
+        chosen = random.choice(candidates)
+        gift_id = getattr(chosen, "id", None)
+        if not gift_id:
+            log.warning("Chosen gift has no id, fallback to queue (user=%s)", user_id)
+            return False
+        # send gift to user (use user_id or chat_id)
+        # Note: send_gift requires either user_id or chat_id; we'll use user_id where possible
+        try:
+            success = await bot.send_gift(gift_id=gift_id, user_id=user_id)
+        except Exception as e:
+            log.exception("send_gift API error for gift_id=%s user=%s: %s", gift_id, user_id, e)
+            success = False
+        if success:
+            log.info("send_gift succeeded gift_id=%s user=%s", gift_id, user_id)
+            # Optionally inform user (we already send textual confirmation elsewhere)
+            try:
+                await bot.send_message(chat_id, f"🎁 Подарок отправлен — откройте профиль, чтобы увидеть подарок.")
+            except Exception:
+                pass
+            return True
+        else:
+            log.info("send_gift returned False for gift_id=%s user=%s", gift_id, user_id)
+            return False
+    except Exception:
+        log.exception("try_send_real_gift failed unexpectedly")
+        return False
+
+# --------------------
+# Referrals & stats & game flow (unchanged except gift handling uses try_send_real_gift)
 # --------------------
 async def register_ref_visit(referred_user: int, inviter: int) -> bool:
     if db_pool:
@@ -479,7 +534,7 @@ async def increment_referred_play(referred_user: int):
                 pass
             if GROUP_ID:
                 try:
-                    await bot.send_message(GROUP_ID, f"{referred_user} сыграл пять игр. Теперь у {inviter} — 1 верифицированный рефераль")
+                    await bot.send_message(GROUP_ID, f"{referred_user} сыграл пять игр. Теперь у {inviter} — 1 верифицированный реферал")
                 except Exception:
                     pass
 
@@ -536,51 +591,34 @@ async def get_stats_summary() -> str:
 # Game flow (wait MIN_WAIT_FROM_LAST_THROW from last throw)
 # --------------------
 async def start_game_flow(chat_id: int, count: int, premium: bool, user_id: int):
-    """
-    Starts the game flow in *chat_id*, but treats `user_id` as the player (for accounting and referrals).
-    Ensures dice messages are sent to chat_id and results + menu appear there.
-    """
     if game_locks.get(chat_id):
         return False, "busy"
     game_locks[chat_id] = True
     try:
         messages = []
         last_send_time = None
-        # send dice messages sequentially with small delay to avoid rate limits
         for i in range(count):
             try:
-                # send_dice returns Message with dice field
                 msg = await bot.send_dice(chat_id, emoji="🏀")
-            except Exception as e:
-                log.exception("send_dice failed in chat %s: %s", chat_id, e)
-                # keep going so we still evaluate whatever messages were delivered
+            except Exception:
+                log.exception("send_dice failed")
                 continue
             last_send_time = time.monotonic()
             messages.append(msg)
-            # small delay to keep dice animation visible distinctly
             await asyncio.sleep(0.5)
-
-        # ensure we waited at least MIN_WAIT_FROM_LAST_THROW after last dice
         if last_send_time is None:
             last_send_time = time.monotonic()
         elapsed = time.monotonic() - last_send_time
         wait_for = MIN_WAIT_FROM_LAST_THROW - elapsed
         if wait_for > 0:
             await asyncio.sleep(wait_for)
-
-        # collect results
         hits = 0
         results = []
         for msg in messages:
             v = getattr(getattr(msg, "dice", None), "value", 0)
-            try:
-                results.append(int(v))
-            except Exception:
-                results.append(0)
+            results.append(int(v))
             if int(v) >= 4:
                 hits += 1
-
-        # bookkeeping & stats
         await inc_user_plays(user_id, len(results))
         await increment_referred_play(user_id)
         await inc_stats(count, premium, hits == len(results) and len(results) > 0)
@@ -588,17 +626,24 @@ async def start_game_flow(chat_id: int, count: int, premium: bool, user_id: int)
         # award gift if win (all hits)
         if len(results) > 0 and hits == len(results):
             if premium:
-                gift_choice = random.choice(PREMIUM_GIFTS)
                 gift_cost = GIFT_VALUES["premium"]
                 bot_stars_now = await get_bot_stars()
+                log.info("Attempting premium gift: bot_stars=%s, gift_cost=%s (user=%s chat=%s)", bot_stars_now, gift_cost, user_id, chat_id)
                 if bot_stars_now < gift_cost:
                     await bot.send_message(chat_id, "⚠️ У бота недостаточно звёзд для покупки премиального подарка.")
                 else:
-                    # Reserve/record stars and queue pending gift for worker
+                    # reserve stars synchronously
                     await change_bot_stars(-gift_cost)
                     await add_user_earned_real(user_id, gift_cost)
-                    await add_pending_gift(user_id, gift_cost, premium=True)
-                    await bot.send_message(chat_id, "🎁 Вы выиграли премиальный подарок — задача покупки/отправки поставлена в очередь.")
+                    # try to send actual gift now
+                    sent = await try_send_real_gift(user_id, chat_id, gift_cost, premium=True)
+                    if not sent:
+                        # fallback to queue
+                        await add_pending_gift(user_id, gift_cost, premium=True)
+                        await bot.send_message(chat_id, "🎁 Вы выиграли премиальный подарок — но его нужно купить/отправить вручную. Задача поставлена в очередь.")
+                    else:
+                        # already informed inside try_send_real_gift and/or below
+                        pass
                     if GROUP_ID:
                         try:
                             spent = int(await (db_pool.fetchval("SELECT spent_real FROM users WHERE user_id=$1", user_id) if db_pool else 0) or 0)
@@ -611,13 +656,22 @@ async def start_game_flow(chat_id: int, count: int, premium: bool, user_id: int)
             else:
                 gift_cost = GIFT_VALUES["normal"]
                 bot_stars_now = await get_bot_stars()
+                log.info("Attempting normal gift: bot_stars=%s, gift_cost=%s (user=%s chat=%s)", bot_stars_now, gift_cost, user_id, chat_id)
                 if bot_stars_now < gift_cost:
                     await bot.send_message(chat_id, "⚠️ У бота недостаточно звёзд для покупки подарка.")
                 else:
                     await change_bot_stars(-gift_cost)
                     await add_user_earned_real(user_id, gift_cost)
-                    await add_pending_gift(user_id, gift_cost, premium=False)
-                    await bot.send_message(chat_id, "🎁 Вы выиграли: 🐻 Мишка или 💖 Сердечко — задача покупки/отправки поставлена в очередь.")
+                    # try to send gift immediately (real Telegram Gift)
+                    sent = await try_send_real_gift(user_id, chat_id, gift_cost, premium=False)
+                    if not sent:
+                        # fallback: queue for worker
+                        await add_pending_gift(user_id, gift_cost, premium=False)
+                        await bot.send_message(chat_id, "🎁 Вы выиграли: 🐻 Мишка или 💖 Сердечко — задача покупки/отправки поставлена в очередь.")
+                    else:
+                        # If success, keep the message consistent with previous UX:
+                        # (try_send_real_gift already sent a short confirmation; keep UX)
+                        pass
                     if GROUP_ID:
                         try:
                             spent = int(await (db_pool.fetchval("SELECT spent_real FROM users WHERE user_id=$1", user_id) if db_pool else 0) or 0)
@@ -628,7 +682,7 @@ async def start_game_flow(chat_id: int, count: int, premium: bool, user_id: int)
                         except Exception:
                             pass
 
-        # results summary (always send, even if some dice failed to be delivered)
+        # results summary
         text_lines = ["🎯 <b>Результаты бросков:</b>\n"]
         if results:
             for v in results:
@@ -640,10 +694,9 @@ async def start_game_flow(chat_id: int, count: int, premium: bool, user_id: int)
         except Exception:
             log.exception("Failed to send results summary to chat %s", chat_id)
 
-        # short pause before follow-ups
         await asyncio.sleep(1)
         try:
-            await bot.send_message(chat_id, "✅ ПОПАДАНИЕ!" if len(results) > 0 and hits == len(results) else "🟡 Не все попали. Попробуем ещё?")
+            await bot.send_message(chat_id, "✅ ПОПАДАНИЕ!" if len(results)>0 and hits==len(results) else "🟡 Не все попали. Попробуем ещё?")
         except Exception:
             log.exception("Failed to send follow-up to chat %s", chat_id)
 
@@ -672,7 +725,6 @@ async def cmd_start(message: types.Message):
             await bot.send_message(GROUP_ID, f"{mention} перешёл в бота", parse_mode=ParseMode.HTML)
     except Exception:
         pass
-    # handle payload (ref)
     payload = ""
     try:
         txt = (message.text or "").strip()
@@ -772,6 +824,7 @@ async def play_callback(call: types.CallbackQuery):
     vstars = await get_user_virtual(user_id)
     if vstars >= cost:
         await change_user_virtual(user_id, -cost)
+        # user paid virtual stars -> bot earns 'cost' stars
         await change_bot_stars(cost)
         await call.answer()
         await start_game_flow(chat_id, cnt, premium, user_id)
@@ -787,7 +840,6 @@ async def play_callback(call: types.CallbackQuery):
     ts = int(time.time())
     payload = f"buy_and_play:{user_id}:{cnt}:{1 if premium else 0}:{ts}"
     try:
-        # invoice is sent to user private chat
         invoice_msg = await bot.send_invoice(
             chat_id=user_id,
             title=title,
@@ -798,7 +850,6 @@ async def play_callback(call: types.CallbackQuery):
             payload=payload,
             start_parameter="buyandplay"
         )
-        # FIXED: Save origin chat id so that after payment we start the game in the original chat
         invoice_map[payload] = (chat_id, invoice_msg.chat.id, invoice_msg.message_id)
         await call.answer("Откройте оплату в личных сообщениях.", show_alert=False)
     except Exception:
@@ -814,7 +865,6 @@ async def on_successful_payment(message: types.Message):
     sp = message.successful_payment
     payload = getattr(sp, "invoice_payload", "") or ""
     payer_id = message.from_user.id
-    # FIXED: use origin_chat_id stored in invoice_map to resume game in correct chat
     if payload.startswith("buy_and_play:"):
         try:
             parts = payload.split(":")
@@ -837,27 +887,29 @@ async def on_successful_payment(message: types.Message):
                 except Exception:
                     log.exception("Failed to delete invoice message")
             else:
-                # fallback: if no mapping, assume start in user's private chat
                 origin_chat_id = payer_id
         except Exception:
             log.exception("invoice_map delete error")
             origin_chat_id = payer_id
         try:
-            paid_amount = int(sp.total_amount or 0)
+            paid_amount_raw = int(sp.total_amount or 0)
         except Exception:
-            paid_amount = 0
-        if paid_amount > 0:
-            await change_bot_stars(paid_amount)
-            await add_user_spent_real(payer_id, paid_amount)
+            paid_amount_raw = 0
+        try:
+            paid_stars = int(paid_amount_raw // STAR_UNIT_MULTIPLIER)
+        except Exception:
+            paid_stars = paid_amount_raw
+        log.info("Payment accepted: raw=%s -> stars=%s (mult=%s) payer=%s", paid_amount_raw, paid_stars, STAR_UNIT_MULTIPLIER, payer_id)
+        if paid_stars > 0:
+            await change_bot_stars(paid_stars)
+            await add_user_spent_real(payer_id, paid_stars)
         await set_user_virtual(payer_id, 0)
-        # If there's a game running in origin chat, notify user; otherwise start game in origin_chat_id
         if game_locks.get(origin_chat_id):
             try:
                 await bot.send_message(payer_id, "Сейчас идёт другая игра в этом чате — ваша оплата зачислена, игра начнётся позже.")
             except Exception:
                 pass
             return
-        # START GAME in origin_chat_id (FIXED)
         await start_game_flow(origin_chat_id, cnt, bool(prem_flag), payer_id)
         return
     if payload.startswith("buy_virtual_"):
@@ -900,7 +952,6 @@ async def pay_virtual_cb(call: types.CallbackQuery):
             payload=payload,
             start_parameter="buyvirtual"
         )
-        # store origin chat as user's private chat (since initiated from there)
         invoice_map[payload] = (user.id, invoice_msg.chat.id, invoice_msg.message_id)
     except Exception:
         log.exception("send_invoice failed")
@@ -915,14 +966,12 @@ async def stat_and_balans_router(message: types.Message):
     if not text:
         return
     lowered = text.lower().split()[0]
-    # /стат
     if lowered == "/стат" or lowered == "стат":
         if GROUP_ID is None or message.chat.id != GROUP_ID:
             return
         summary = await get_stats_summary()
         await message.answer(summary)
         return
-    # /баланс or баланс
     if lowered.startswith("/баланс") or lowered == "баланс":
         if GROUP_ID is None or message.chat.id != GROUP_ID:
             return
