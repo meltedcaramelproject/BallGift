@@ -29,6 +29,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 GROUP_ID_RAW = os.getenv("GROUP_ID", "")
 PAYMENTS_PROVIDER_TOKEN = os.getenv("PAYMENTS_PROVIDER_TOKEN", "")
 ADMIN_ID = os.getenv("ADMIN_ID")
+PUBLIC_URL = os.getenv("PUBLIC_URL", "")  # optional
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
@@ -41,14 +42,15 @@ except Exception:
     GROUP_ID = None
 
 # -------------- sanity check: InlineKeyboardButton(copy_text=...) support --------------
-# If aiogram does not support copy_text param, fail early with instructions.
+# Try to construct a test button with types.CopyTextButton. If pydantic/aiogram doesn't accept it,
+# raise a clear error so you can upgrade aiogram.
 try:
-    _ = InlineKeyboardButton(text="test-copy", copy_text="t")
-except TypeError as e:
+    _ = InlineKeyboardButton(text="test-copy", copy_text=types.CopyTextButton(text="t"))
+except Exception as e:
     raise RuntimeError(
-        "Your aiogram version does not support InlineKeyboardButton(copy_text=...). "
-        "Update aiogram to a version that supports copy_text (e.g. run: pip install -U 'aiogram>=3.24.0'). "
-        f"Original error: {e}"
+        "Your aiogram/pydantic installation does not accept InlineKeyboardButton(copy_text=...). "
+        "Upgrade aiogram/pydantic in your environment (e.g. `pip install -U aiogram asyncpg aiohttp pydantic`)."
+        f"\nOriginal error: {e}"
     )
 
 # --------------------
@@ -83,7 +85,7 @@ BUTTONS = {
 GIFT_VALUES = {"normal": 15, "premium": 25}
 PREMIUM_GIFTS = ["premium_present", "rose"]
 
-# For XTR: 1 star -> amount=1
+# For XTR: 1 star -> amount=1 (currency smallest unit; adjust if needed)
 STAR_UNIT_MULTIPLIER = 1
 
 # Free cooldown seconds
@@ -139,9 +141,7 @@ REPLY_MENU = ReplyKeyboardMarkup(
 
 def build_ref_keyboard_with_link(user_id: int, bot_username: str) -> InlineKeyboardMarkup:
     """
-    STRICT: only create native copy_text button. No fallback that shows link.
-    This function WILL create InlineKeyboardButton(copy_text=link) and expect the client
-    to support it. If aiogram didn't support copy_text earlier, we already failed at import.
+    STRICT: create native copy_text button using types.CopyTextButton(text=link)
     """
     if bot_username:
         link = f"https://t.me/{bot_username}?start={user_id}"
@@ -152,8 +152,8 @@ def build_ref_keyboard_with_link(user_id: int, bot_username: str) -> InlineKeybo
 
     kb_rows = []
     kb_rows.append([InlineKeyboardButton(text="➡️ Отправить другу", url=share_url)])
-    # Strict native copy_text button (no fallback)
-    btn_copy = InlineKeyboardButton(text="🔗 Скопировать ссылку", copy_text=link)
+    # Native copy_text via types.CopyTextButton
+    btn_copy = InlineKeyboardButton(text="🔗 Скопировать ссылку", copy_text=types.CopyTextButton(text=link))
     kb_rows.append([btn_copy])
     kb_rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="ref_back")])
     return InlineKeyboardMarkup(inline_keyboard=kb_rows)
@@ -367,7 +367,7 @@ async def set_bot_stars_absolute(value: int) -> int:
     return bot._mem_bot_stars
 
 # --------------------
-# Referrals (SQL)
+# Referrals & stats & game flow (unchanged logic)
 # --------------------
 async def register_ref_visit(referred_user: int, inviter: int) -> bool:
     if db_pool:
@@ -458,9 +458,6 @@ async def increment_referred_play(referred_user: int):
                 except Exception:
                     pass
 
-# --------------------
-# Stats
-# --------------------
 async def inc_stats(count: int, premium: bool, win: bool):
     if db_pool:
         try:
@@ -671,16 +668,15 @@ async def ref_back(call: types.CallbackQuery):
         await call.message.answer(START_TEXT_TEMPLATE.format(virtual_stars=v), reply_markup=build_main_keyboard(uid), parse_mode=ParseMode.HTML)
 
 # --------------------
-# Play handling (sends invoice and stores mapping)
+# Play/payment/stat/balance handlers
+# (exact same logic as earlier full file)
 # --------------------
 @dp.callback_query(F.data and F.data.startswith("play_"))
 async def play_callback(call: types.CallbackQuery):
     chat_id = call.message.chat.id
     user_id = call.from_user.id
-    # ensure user exists
     await ensure_user(user_id)
 
-    # busy check
     if game_locks.get(chat_id):
         await call.answer("Сначала дождитесь окончания текущей игры!", show_alert=True)
         return
@@ -692,11 +688,9 @@ async def play_callback(call: types.CallbackQuery):
 
     cnt, cost, premium, prefix = BUTTONS[key]
 
-    # free case
     if cost == 0:
         now = int(time.time())
         free_next = await get_user_free_next(user_id)
-        log.info(f"user {user_id} free_next={free_next} now={now}")
         if now < free_next:
             rem = free_next - now
             mins = rem // 60
@@ -705,7 +699,6 @@ async def play_callback(call: types.CallbackQuery):
             sec_word = "секунд" if secs != 1 else "секунду"
             try:
                 await call.answer(f"🏀 Вы сможете повторно сделать бесплатный бросок через {mins} {min_word} и {secs} {sec_word}", show_alert=True)
-                log.info(f"Shown popup to user {user_id} with remaining {rem}s")
             except Exception:
                 try:
                     await bot.send_message(user_id, f"🏀 Вы сможете повторно сделать бесплатный бросок через {mins} {min_word} и {secs} {sec_word}")
@@ -713,13 +706,11 @@ async def play_callback(call: types.CallbackQuery):
                 except Exception:
                     await call.answer("Подождите...", show_alert=False)
             return
-        # set next free
         await set_user_free_next(user_id, now + FREE_COOLDOWN)
-        await call.answer()  # acknowledge the press
+        await call.answer()
         await start_game_flow(chat_id, cnt, premium, user_id)
         return
 
-    # paid logic
     vstars = await get_user_virtual(user_id)
     if vstars >= cost:
         await change_user_virtual(user_id, -cost)
@@ -728,7 +719,6 @@ async def play_callback(call: types.CallbackQuery):
         await start_game_flow(chat_id, cnt, premium, user_id)
         return
 
-    # insufficient virtual stars -> immediate invoice to user's private chat
     missing = cost - vstars
     noun = word_form_mяч(cnt)
     title = f"{cnt} {noun}"
@@ -755,9 +745,6 @@ async def play_callback(call: types.CallbackQuery):
         log.exception("send_invoice failed")
         await call.answer("Не удалось создать платёж. Проверьте Payments в BotFather.", show_alert=True)
 
-# --------------------
-# Payment handlers (delete invoice message on success, credit bot_stars, start game)
-# --------------------
 @dp.pre_checkout_query()
 async def precheckout_handler(pre_q: PreCheckoutQuery):
     await bot.answer_pre_checkout_query(pre_q.id, ok=True)
@@ -780,7 +767,6 @@ async def on_successful_payment(message: types.Message):
         except Exception:
             cnt = 1
             prem_flag = 0
-        # delete invoice message if stored
         try:
             mapping = invoice_map.pop(payload, None)
             if mapping:
@@ -791,7 +777,6 @@ async def on_successful_payment(message: types.Message):
                     log.exception("Failed to delete invoice message")
         except Exception:
             log.exception("invoice_map delete error")
-        # amount paid (total_amount) — credits bot_stars
         try:
             paid_amount = int(sp.total_amount or 0)
         except Exception:
@@ -799,15 +784,12 @@ async def on_successful_payment(message: types.Message):
         if paid_amount > 0:
             await change_bot_stars(paid_amount)
             await add_user_spent_real(payer_id, paid_amount)
-        # reset payer virtual balance to 0
         await set_user_virtual(payer_id, 0)
-        # start the game in payer's private chat
         if game_locks.get(payer_id):
             await bot.send_message(payer_id, "Сейчас идёт другая игра в этом чате — ваша оплата зачислена, игра начнётся позже.")
             return
         await start_game_flow(payer_id, cnt, bool(prem_flag), payer_id)
         return
-    # fallback: buy_virtual...
     if payload.startswith("buy_virtual_"):
         try:
             parts = payload.split("_")
