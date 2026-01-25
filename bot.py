@@ -27,8 +27,8 @@ log = logging.getLogger("ballbot")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 GROUP_ID_RAW = os.getenv("GROUP_ID", "")
-PUBLIC_URL = os.getenv("PUBLIC_URL", "")  # for WebApp copy feature (https required)
-PAYMENTS_PROVIDER_TOKEN = os.getenv("PAYMENTS_PROVIDER_TOKEN", "")  # leave empty for Telegram Stars (XTR)
+PUBLIC_URL = os.getenv("PUBLIC_URL", "")  # optional webapp copy fallback (https)
+PAYMENTS_PROVIDER_TOKEN = os.getenv("PAYMENTS_PROVIDER_TOKEN", "")
 ADMIN_ID = os.getenv("ADMIN_ID")
 
 if not BOT_TOKEN:
@@ -86,7 +86,6 @@ MIN_WAIT_FROM_LAST_THROW = 4.0
 # UI Helpers
 # --------------------
 def word_form_mяч(count: int) -> str:
-    # 1 -> "мяч", 2-4 -> "мяча", 5+ -> "мячей"
     if count == 1:
         return "мяч"
     if 2 <= count <= 4:
@@ -94,14 +93,6 @@ def word_form_mяч(count: int) -> str:
     return "мячей"
 
 def build_main_keyboard(user_id: Optional[int] = None) -> InlineKeyboardMarkup:
-    """
-    Layout:
-    Row1: 6
-    Row2: 5,4
-    Row3: 3,2
-    Row4: 1, prem1
-    Row5: +3⭐ за друга
-    """
     kb = []
     def btn_text(key):
         cnt, cost, prem, prefix = BUTTONS[key]
@@ -137,12 +128,6 @@ REPLY_MENU = ReplyKeyboardMarkup(
 )
 
 def build_ref_keyboard_with_link(user_id: int, bot_username: str) -> InlineKeyboardMarkup:
-    """
-    Builds referral keyboard:
-     - "➡️ Отправить другу" -> share URL (opens chooser)
-     - "🔗 Скопировать ссылку" -> natively copies text to clipboard via copy_text (if client supports)
-     - "◀️ Назад"
-    """
     if bot_username:
         link = f"https://t.me/{bot_username}?start={user_id}"
     else:
@@ -150,22 +135,26 @@ def build_ref_keyboard_with_link(user_id: int, bot_username: str) -> InlineKeybo
     share_text = f"🏀 Приглашаю тебя сыграть в баскет за подарки!\n{link}"
     share_url = f"https://t.me/share/url?text={urllib.parse.quote(share_text)}"
 
-    buttons = []
-    buttons.append([InlineKeyboardButton(text="➡️ Отправить другу", url=share_url)])
-    # Native copy button (Bot API: copy_text). If client supports — it will copy to clipboard.
+    kb = []
+    kb.append([InlineKeyboardButton(text="➡️ Отправить другу", url=share_url)])
+
+    # try native copy_text
     try:
-        # InlineKeyboardButton supports `copy_text` parameter in recent aiogram versions
-        buttons.append([InlineKeyboardButton(text="🔗 Скопировать ссылку", copy_text=link)])
-    except TypeError:
-        # Fallback: if aiogram version doesn't support copy_text param, use webapp/copy or a callback
+        btn_copy = InlineKeyboardButton(text="🔗 Скопировать ссылку", **{"copy_text": link})
+        kb.append([btn_copy])
+        log.info("Using native copy_text button")
+    except Exception:
+        # fallback to web app copy if PUBLIC_URL provided, else callback that shows link in alert
         if PUBLIC_URL:
             copy_url = f"{PUBLIC_URL.rstrip('/')}/webapp/copy?link={urllib.parse.quote(link, safe='')}"
-            buttons.append([InlineKeyboardButton(text="🔗 Скопировать ссылку", web_app=WebAppInfo(url=copy_url))])
+            kb.append([InlineKeyboardButton(text="🔗 Скопировать ссылку", web_app=WebAppInfo(url=copy_url))])
+            log.info("Using WebApp copy fallback")
         else:
-            # fallback to simple callback that will show link in alert
-            buttons.append([InlineKeyboardButton(text="🔗 Показать ссылку", callback_data=f"show_ref_{user_id}")])
-    buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="ref_back")])
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
+            kb.append([InlineKeyboardButton(text="🔗 Показать ссылку", callback_data=f"show_ref_{user_id}")])
+            log.info("Using callback fallback for copy (show_ref)")
+
+    kb.append([InlineKeyboardButton(text="◀️ Назад", callback_data="ref_back")])
+    return InlineKeyboardMarkup(inline_keyboard=kb)
 
 # --------------------
 # DB INIT (creates tables)
@@ -276,7 +265,6 @@ async def set_user_virtual(user_id: int, value: int) -> int:
     return bot._mem_users[user_id]["virtual_stars"]
 
 async def get_user_free_next(user_id: int) -> int:
-    # ensure_user before reading to ensure row exists
     await ensure_user(user_id)
     if db_pool:
         try:
@@ -365,7 +353,6 @@ async def change_bot_stars(delta: int) -> int:
     return cur
 
 async def set_bot_stars_absolute(value: int) -> int:
-    """Установить абсолютное значение звёзд у бота (используется командой в группе)."""
     if db_pool:
         try:
             async with db_pool.acquire() as conn:
@@ -657,10 +644,10 @@ async def open_main_menu(message: types.Message):
     v = await get_user_virtual(uid)
     await message.answer(START_TEXT_TEMPLATE.format(virtual_stars=v), reply_markup=build_main_keyboard(uid))
 
-@dp.callback_query(lambda c: c.data == "ref_menu")
+@dp.callback_query(F.data == "ref_menu")
 async def ref_menu(call: types.CallbackQuery):
     uid = call.from_user.id
-    # fetch current bot username and build keyboard using it
+    await call.answer()  # acknowledge
     try:
         me = await bot.get_me()
         bot_username = me.username or ""
@@ -669,11 +656,11 @@ async def ref_menu(call: types.CallbackQuery):
     try:
         await call.message.edit_text(REF_TEXT_HTML, reply_markup=build_ref_keyboard_with_link(uid, bot_username), parse_mode=ParseMode.HTML)
     except Exception:
+        # fallback send
         await call.message.answer(REF_TEXT_HTML, reply_markup=build_ref_keyboard_with_link(uid, bot_username), parse_mode=ParseMode.HTML)
 
-@dp.callback_query(lambda c: c.data and c.data.startswith("show_ref_"))
+@dp.callback_query(F.data and F.data.startswith("show_ref_"))
 async def show_ref_callback(call: types.CallbackQuery):
-    # fallback for old aiogram versions / clients: show link in alert
     try:
         uid = int(call.data.split("_", 2)[2])
     except Exception:
@@ -686,9 +673,10 @@ async def show_ref_callback(call: types.CallbackQuery):
     link = f"https://t.me/{bot_username}?start={uid}" if bot_username else f"/start {uid}"
     await call.answer(text=link, show_alert=True)
 
-@dp.callback_query(lambda c: c.data == "ref_back")
+@dp.callback_query(F.data == "ref_back")
 async def ref_back(call: types.CallbackQuery):
     uid = call.from_user.id
+    await call.answer()
     v = await get_user_virtual(uid)
     try:
         await call.message.edit_text(START_TEXT_TEMPLATE.format(virtual_stars=v), reply_markup=build_main_keyboard(uid), parse_mode=ParseMode.HTML)
@@ -698,46 +686,65 @@ async def ref_back(call: types.CallbackQuery):
 # --------------------
 # Play handling (sends invoice and stores mapping)
 # --------------------
-@dp.callback_query(lambda c: c.data and c.data.startswith("play_"))
+@dp.callback_query(F.data and F.data.startswith("play_"))
 async def play_callback(call: types.CallbackQuery):
     chat_id = call.message.chat.id
-    # ensure user row exists so cooldown works
     user_id = call.from_user.id
+    # ensure user exists
     await ensure_user(user_id)
 
+    # busy check
     if game_locks.get(chat_id):
-        await call.answer("Сначала дождитесь окончания текущей игры!", show_alert=False)
+        # non-alert toast (small) — but user asked for screen notification: use show_alert=True for stricter popup
+        await call.answer("Сначала дождитесь окончания текущей игры!", show_alert=True)
         return
-    await call.answer()
+
     key = call.data.split("_", 1)[1]
     if key not in BUTTONS:
-        await call.message.answer("Неизвестная кнопка.")
+        await call.answer("Неизвестная кнопка.", show_alert=True)
         return
+
     cnt, cost, premium, prefix = BUTTONS[key]
-    # free
+
+    # free case
     if cost == 0:
         now = int(time.time())
         free_next = await get_user_free_next(user_id)
+        log.info(f"user {user_id} free_next={free_next} now={now}")
         if now < free_next:
             rem = free_next - now
             mins = rem // 60
             secs = rem % 60
             min_word = "минут" if mins != 1 else "минуту"
             sec_word = "секунд" if secs != 1 else "секунду"
-            # show popup notification with remaining time
-            await call.answer(f"🏀 Вы сможете повторно сделать бесплатный бросок через {mins} {min_word} и {secs} {sec_word}", show_alert=True)
+            # try popup
+            try:
+                await call.answer(f"🏀 Вы сможете повторно сделать бесплатный бросок через {mins} {min_word} и {secs} {sec_word}", show_alert=True)
+                log.info(f"Shown popup to user {user_id} with remaining {rem}s")
+            except Exception:
+                # fallback: send private message (less intrusive)
+                try:
+                    await bot.send_message(user_id, f"🏀 Вы сможете повторно сделать бесплатный бросок через {mins} {min_word} и {secs} {sec_word}")
+                    await call.answer()  # still answer callback
+                except Exception:
+                    await call.answer("Подождите...", show_alert=False)
             return
+        # set next free
         await set_user_free_next(user_id, now + FREE_COOLDOWN)
+        await call.answer()  # acknowledge the press
         await start_game_flow(chat_id, cnt, premium, user_id)
         return
-    # paid
+
+    # paid logic
     vstars = await get_user_virtual(user_id)
     if vstars >= cost:
         await change_user_virtual(user_id, -cost)
         await change_bot_stars(cost)
+        await call.answer()
         await start_game_flow(chat_id, cnt, premium, user_id)
         return
-    # insufficient -> immediately create invoice and send to user's private chat
+
+    # insufficient virtual stars -> immediate invoice to user's private chat
     missing = cost - vstars
     noun = word_form_mяч(cnt)
     title = f"{cnt} {noun}"
@@ -746,7 +753,6 @@ async def play_callback(call: types.CallbackQuery):
     amount = int(missing * STAR_UNIT_MULTIPLIER)
     prices = [LabeledPrice(label=label, amount=amount)]
     ts = int(time.time())
-    # payload: buy_and_play:{payer_id}:{count}:{prem}:{ts}
     payload = f"buy_and_play:{user_id}:{cnt}:{1 if premium else 0}:{ts}"
     try:
         invoice_msg = await bot.send_invoice(
@@ -759,13 +765,11 @@ async def play_callback(call: types.CallbackQuery):
             payload=payload,
             start_parameter="buyandplay"
         )
-        try:
-            invoice_map[payload] = (invoice_msg.chat.id, invoice_msg.message_id)
-        except Exception:
-            log.exception("Failed to store invoice mapping")
+        invoice_map[payload] = (invoice_msg.chat.id, invoice_msg.message_id)
+        await call.answer("Откройте оплату в личных сообщениях.", show_alert=False)
     except Exception:
         log.exception("send_invoice failed")
-        await call.message.answer("Не удалось создать платёж. Проверьте Payments в BotFather.")
+        await call.answer("Не удалось создать платёж. Проверьте Payments в BotFather.", show_alert=True)
 
 # --------------------
 # Payment handlers (delete invoice message on success, credit bot_stars, start game)
@@ -819,7 +823,7 @@ async def on_successful_payment(message: types.Message):
             return
         await start_game_flow(payer_id, cnt, bool(prem_flag), payer_id)
         return
-    # fallback: other payloads
+    # fallback: buy_virtual...
     if payload.startswith("buy_virtual_"):
         try:
             parts = payload.split("_")
@@ -837,7 +841,7 @@ async def on_successful_payment(message: types.Message):
     else:
         await message.answer("Платёж принят. Спасибо!")
 
-@dp.callback_query(lambda c: c.data and c.data.startswith("pay_virtual_"))
+@dp.callback_query(F.data and F.data.startswith("pay_virtual_"))
 async def pay_virtual_cb(call: types.CallbackQuery):
     await call.answer()
     try:
@@ -868,75 +872,65 @@ async def pay_virtual_cb(call: types.CallbackQuery):
 # --------------------
 # Commands: /стат and /баланс (group only)
 # --------------------
-@dp.message()
-async def stat_cmd(message: types.Message):
+@dp.message(F.text)
+async def stat_and_balans_router(message: types.Message):
     text = (message.text or "").strip()
     if not text:
         return
-    lowered = text.lower()
-    if not (lowered == "/стат" or lowered.split()[0] == "стат"):
-        return
-    if GROUP_ID is None or message.chat.id != GROUP_ID:
-        return
-    summary = await get_stats_summary()
-    await message.answer(summary)
-
-@dp.message()
-async def balans_cmd(message: types.Message):
-    text = (message.text or "").strip()
-    if not text:
-        return
-    lowered = text.lower()
-    if not (lowered.startswith("/баланс") or lowered.split()[0] == "баланс"):
-        return
-    # only in group
-    if GROUP_ID is None or message.chat.id != GROUP_ID:
-        return
-    parts = text.split()
-    # /баланс 123  -> set bot stars absolute
-    if len(parts) == 2 and parts[1].lstrip("-").isdigit():
-        amount = int(parts[1])
-        newval = await set_bot_stars_absolute(amount)
-        await message.answer(f"Баланс бота (реальные звёзд) установлен: <b>{newval}</b>")
-        return
-    # /баланс -> show bot stars
-    if len(parts) == 1:
-        b = await get_bot_stars()
-        await message.answer(f"💰 Баланс бота (реальные звёзд): <b>{b}</b>")
-        return
-    # /баланс <user> <amount> -> set user's virtual stars
-    if len(parts) >= 3:
-        user_token = parts[1]
-        amount_token = parts[2]
-        target_id = None
-        if user_token.lstrip("-").isdigit():
-            target_id = int(user_token)
-        elif user_token.startswith("@"):
-            try:
-                chat = await bot.get_chat(user_token)
-                target_id = chat.id
-            except Exception:
-                await message.answer("Не удалось найти пользователя.")
-                return
-        else:
-            # try to resolve username/chat
-            try:
-                chat = await bot.get_chat(user_token)
-                target_id = chat.id
-            except Exception:
-                await message.answer("Не удалось найти пользователя.")
-                return
-        if not amount_token.lstrip("-").isdigit():
-            await message.answer("Неверный формат числа.")
+    lowered = text.lower().split()[0]
+    # /стат
+    if lowered == "/стат" or lowered == "стат":
+        if GROUP_ID is None or message.chat.id != GROUP_ID:
             return
-        amount = int(amount_token)
-        await set_user_virtual(target_id, amount)
-        await message.answer(f"Баланс пользователя {target_id} установлен: <b>{amount}⭐</b>")
+        summary = await get_stats_summary()
+        await message.answer(summary)
         return
-    await message.answer("Использование: баланс OR баланс <число> (устанавливает реальный баланс бота) OR баланс <user> <amount> (устанавливает виртуальные звёзды пользователю) — только в группе.")
+    # /баланс or баланс
+    if lowered.startswith("/баланс") or lowered == "баланс":
+        if GROUP_ID is None or message.chat.id != GROUP_ID:
+            return
+        parts = text.split()
+        if len(parts) == 1:
+            b = await get_bot_stars()
+            await message.answer(f"💰 Баланс бота (реальные звёзд): <b>{b}</b>")
+            return
+        if len(parts) == 2 and parts[1].lstrip("-").isdigit():
+            amount = int(parts[1])
+            newval = await set_bot_stars_absolute(amount)
+            await message.answer(f"Баланс бота (реальные звёзд) установлен: <b>{newval}</b>")
+            return
+        if len(parts) >= 3:
+            user_token = parts[1]
+            amount_token = parts[2]
+            target_id = None
+            if user_token.lstrip("-").isdigit():
+                target_id = int(user_token)
+            elif user_token.startswith("@"):
+                try:
+                    chat = await bot.get_chat(user_token)
+                    target_id = chat.id
+                except Exception:
+                    await message.answer("Не удалось найти пользователя.")
+                    return
+            else:
+                try:
+                    chat = await bot.get_chat(user_token)
+                    target_id = chat.id
+                except Exception:
+                    await message.answer("Не удалось найти пользователя.")
+                    return
+            if not amount_token.lstrip("-").isdigit():
+                await message.answer("Неверный формат числа.")
+                return
+            amount = int(amount_token)
+            await set_user_virtual(target_id, amount)
+            await message.answer(f"Баланс пользователя {target_id} установлен: <b>{amount}⭐</b>")
+            return
+        await message.answer("Использование: баланс OR баланс <число> OR баланс <user> <amount> — только в группе.")
+        return
 
 # --------------------
-# Web app HTML for copy
+# Web app HTML for copy (fallback)
 # --------------------
 WEBAPP_HTML = r"""<!doctype html>
 <html>
