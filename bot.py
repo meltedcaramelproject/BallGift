@@ -414,7 +414,7 @@ async def increment_referred_play(referred_user: int):
                 pass
             if GROUP_ID:
                 try:
-                    await bot.send_message(GROUP_ID, f"{referred_user} сыграл пять игр. Теперь у {inviter} — 1 верифицированный реферал")
+                    await bot.send_message(GROUP_ID, f"{referred_user} сыграл пять игр. Теперь у {inviter} — 1 верифицированный рефераль")
                 except Exception:
                     pass
 
