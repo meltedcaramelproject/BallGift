@@ -1,5 +1,5 @@
 # Полный файл: bot (1).py
-# Изменение: FREE_COOLDOWN = 15 * 60 (15 минут)
+# Изменение: FREE_COOLDOWN = 24 * 60 * 60 (24 часа)
 # Все остальные функции и логика оставлены без изменений.
 
 import asyncio
@@ -69,7 +69,7 @@ GIFT_VALUES = {"normal": 15, "premium": 25}
 STAR_UNIT_MULTIPLIER = 1
 
 # Free cooldown seconds
-FREE_COOLDOWN = 15 * 60  # 15 minutes
+FREE_COOLDOWN = 24 * 60 * 60  # 24 hours
 
 # Minimal wait after last throw before showing results (4 seconds from last throw)
 MIN_WAIT_FROM_LAST_THROW = 4.0
@@ -598,7 +598,7 @@ async def inc_stats(count: int, premium: bool, win: bool):
             rec["losses"] += 1
 
 # --------------------
-# Game flow
+# Game flow (wait MIN_WAIT_FROM_LAST_THROW from last throw)
 # --------------------
 async def start_game_flow(chat_id: int, count: int, premium: bool, user_id: int, paid_real_amount: int = 0):
     if await is_banned(user_id):
@@ -645,50 +645,63 @@ async def start_game_flow(chat_id: int, count: int, premium: bool, user_id: int,
         await increment_referred_play(user_id)
         await inc_stats(count, premium, hits == len(results) and len(results) > 0)
 
-        win = len(results) > 0 and hits == len(results)
-        won_amount = 0
-        spent_real = int(paid_real_amount or 0)
-
-        if win:
-            # 1) send hits summary
+        # award gift if win (all hits)
+        if len(results) > 0 and hits == len(results):
+            # send hits summary first
             try:
                 await bot.send_message(chat_id, f"🎯 Вы попали: {hits}/{len(results)}")
             except Exception:
                 log.exception("Failed to send hits summary to chat %s", chat_id)
 
-            # 2) Try to send gift
-            gift_cost = GIFT_VALUES["premium"] if premium else GIFT_VALUES["normal"]
+            if premium:
+                gift_cost = GIFT_VALUES["premium"]
+            else:
+                gift_cost = GIFT_VALUES["normal"]
             bot_balance_before = await get_real_bot_stars()
             if bot_balance_before >= gift_cost:
                 sent = await try_send_real_gift(user_id, chat_id, gift_cost, premium=premium)
                 if sent:
-                    won_amount = gift_cost
+                    await add_user_earned_real(user_id, gift_cost)
                 else:
                     await add_pending_gift(user_id, gift_cost, premium=premium)
-                    won_amount = gift_cost
+                    await add_user_earned_real(user_id, gift_cost)
                     try:
                         await bot.send_message(chat_id, "🎁 Вы выиграли подарок — его покупка/отправка поставлена в очередь.")
                     except Exception:
-                        log.exception("Failed to send queued gift message to chat %s", chat_id)
+                        pass
             else:
                 await add_pending_gift(user_id, gift_cost, premium=premium)
-                won_amount = gift_cost
+                await add_user_earned_real(user_id, gift_cost)
                 try:
                     await bot.send_message(chat_id, "🎁 Вы выиграли подарок — его покупка/отправка поставлена в очередь.")
                 except Exception:
-                    log.exception("Failed to send queued gift message to chat %s", chat_id)
+                    pass
 
             bot_balance_after = await get_real_bot_stars()
 
-            # 3) send main menu immediately
+            # send main menu
             try:
                 vnow = await get_user_virtual(user_id)
                 await bot.send_message(chat_id, START_TEXT_TEMPLATE.format(virtual_stars=vnow), reply_markup=build_main_keyboard(user_id))
             except Exception:
                 log.exception("Failed to send main menu to chat %s", chat_id)
-
+            # send group summary
+            if GROUP_ID:
+                try:
+                    actor = await get_user_display_short(user_id)
+                    msg = (
+                        f"🎁 Пользователь {actor} выиграл\n\n"
+                        f"Бросков: {len(results)}🏀\n"
+                        f"Он потратил: {int(paid_real_amount or 0)}⭐\n"
+                        f"Он выиграл: {gift_cost}⭐\n"
+                        f"Остаток баланса бота: {int(bot_balance_after)}⭐"
+                    )
+                    await bot.send_message(GROUP_ID, msg, parse_mode=ParseMode.HTML)
+                except Exception:
+                    log.exception("Failed to send group summary to GROUP_ID")
+            return True, "win"
         else:
-            # Non-win: existing summary
+            # Non-win flow
             text_lines = ["🎯 <b>Результаты бросков:</b>\n"]
             if results:
                 for v in results:
@@ -706,7 +719,6 @@ async def start_game_flow(chat_id: int, count: int, premium: bool, user_id: int,
             except Exception:
                 log.exception("Failed to send follow-up to chat %s", chat_id)
 
-            won_amount = 0
             bot_balance_after = await get_real_bot_stars()
 
             await asyncio.sleep(1)
@@ -716,26 +728,22 @@ async def start_game_flow(chat_id: int, count: int, premium: bool, user_id: int,
             except Exception:
                 log.exception("Failed to send main menu to chat %s", chat_id)
 
-        # Send group summary to GROUP_ID
-        if GROUP_ID:
-            try:
-                actor = await get_user_display_short(user_id)
-                emoji = "🎁" if win else "🥺"
-                verb = "выиграл" if win else "проиграл"
-                spent_display = spent_real
-                won_display = int(won_amount or 0)
-                msg = (
-                    f"{emoji} Пользователь {actor} {verb}\n\n"
-                    f"Бросков: {len(results)}🏀\n"
-                    f"Он потратил: {spent_display}⭐\n"
-                    f"Он выиграл: {won_display}⭐\n"
-                    f"Остаток баланса бота: {int(bot_balance_after)}⭐"
-                )
-                await bot.send_message(GROUP_ID, msg, parse_mode=ParseMode.HTML)
-            except Exception:
-                log.exception("Failed to send group summary to GROUP_ID")
+            # group summary for loss
+            if GROUP_ID:
+                try:
+                    actor = await get_user_display_short(user_id)
+                    msg = (
+                        f"🥺 Пользователь {actor} проиграл\n\n"
+                        f"Бросков: {len(results)}🏀\n"
+                        f"Он потратил: {int(paid_real_amount or 0)}⭐\n"
+                        f"Он выиграл: 0⭐\n"
+                        f"Остаток баланса бота: {int(bot_balance_after)}⭐"
+                    )
+                    await bot.send_message(GROUP_ID, msg, parse_mode=ParseMode.HTML)
+                except Exception:
+                    log.exception("Failed to send group summary to GROUP_ID")
 
-        return True, "win" if win else "ok"
+            return True, "ok"
     finally:
         game_locks.pop(chat_id, None)
 
@@ -744,7 +752,8 @@ async def start_game_flow(chat_id: int, count: int, premium: bool, user_id: int,
 # --------------------
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
-    uid = message.from_user.id
+    user = message.from_user
+    uid = user.id
     if await is_banned(uid):
         try:
             await message.answer("⚠️ Вы забанены и не можете взаимодействовать с ботом.")
@@ -762,6 +771,7 @@ async def cmd_start(message: types.Message):
                 pass
     except Exception:
         pass
+    # handle payload (ref)
     payload = ""
     try:
         txt = (message.text or "").strip()
@@ -902,7 +912,7 @@ async def play_callback(call: types.CallbackQuery):
             start_parameter="buyandplay"
         )
         invoice_map[payload] = (chat_id, invoice_msg.chat.id, invoice_msg.message_id)
-        # Do not show the "откройте в лс" message per user's request
+        # per user's wish: do not show "Откройте оплату в личных сообщениях."
         await call.answer()
     except Exception:
         log.exception("send_invoice failed")
