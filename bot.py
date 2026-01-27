@@ -1,5 +1,5 @@
 # Полный файл: bot (1).py
-# Изменение: FREE_COOLDOWN = 24 * 60 * 60 (24 часа)
+# Изменение: при уведомлении о таймере до следующего бесплатного броска время отображается в часах и минутах.
 # Все остальные функции и логика оставлены без изменений.
 
 import asyncio
@@ -478,11 +478,10 @@ async def register_ref_visit(referred_user: int, inviter: int) -> bool:
                     "INSERT INTO referrals (referred_user, inviter, plays, plays_left, rewarded) VALUES ($1, $2, 0, 5, FALSE) ON CONFLICT (referred_user) DO NOTHING",
                     referred_user, inviter
                 )
-                # if inserted, res ends with "INSERT 0 1" or similar; check for insertion
                 if res and res.endswith(" 1"):
                     mention = await get_user_mention_link(referred_user)
                     try:
-                        await bot.send_message(inviter, f"🔗 По вашей ссылке перешёл {mention}. Вы получите +3⭐ после того, как он сыграет 5 игр", parse_mode=ParseMode.HTML)
+                        await bot.send_message(inviter, f"🔗 По вашей ссылке перешёл {mention}. Вы получите +3⭐ на баланс в боте после того, как он сыграет 5 игр", parse_mode=ParseMode.HTML)
                     except Exception:
                         pass
                     if GROUP_ID:
@@ -504,7 +503,7 @@ async def register_ref_visit(referred_user: int, inviter: int) -> bool:
     bot._mem_referrals[referred_user] = {"inviter": inviter, "plays": 0, "plays_left": 5, "rewarded": False}
     mention = await get_user_mention_link(referred_user)
     try:
-        await bot.send_message(inviter, f"🔗 По вашей ссылке перешёл {mention}. Вы получите +3⭐ после того, как он сыграет 5 игр", parse_mode=ParseMode.HTML)
+        await bot.send_message(inviter, f"🔗 По вашей ссылке перешёл {mention}. Вы получите +3⭐ на баланс в боте после того, как он сыграет 5 игр", parse_mode=ParseMode.HTML)
     except Exception:
         pass
     if GROUP_ID:
@@ -533,12 +532,12 @@ async def increment_referred_play(referred_user: int):
                 plays += 1
                 plays_left = max(plays_left - 1, 0)
                 if plays_left <= 0:
-                    # reward inviter
+                    # reward inviter once: set rewarded TRUE and credit +3 to inviter internal balance
                     await conn.execute("UPDATE referrals SET plays=$1, plays_left=$2, rewarded=TRUE WHERE referred_user=$3", plays, plays_left, referred_user)
-                    # credit inviter with 3 virtual stars
+                    # credit inviter with 3 virtual stars (internal balance)
                     await change_user_virtual(inviter, 3)
                     try:
-                        await bot.send_message(inviter, "🔥 Вам начислено +3⭐ — приглашённый сыграл 5 раз!")
+                        await bot.send_message(inviter, "🔥 Вам начислено +3⭐ на баланс в боте — приглашённый сыграл 5 раз!")
                     except Exception:
                         pass
                     # notify group
@@ -546,7 +545,7 @@ async def increment_referred_play(referred_user: int):
                         try:
                             actor = await get_user_display_short(inviter)
                             mention = await get_user_mention_link(referred_user)
-                            await bot.send_message(GROUP_ID, f"{actor}: приглашённый {mention} сыграл пять игр и был засчитан. +3⭐ начислено.", parse_mode=ParseMode.HTML)
+                            await bot.send_message(GROUP_ID, f"{actor}: приглашённый {mention} сыграл пять игр и был засчитан. +3⭐ на баланс в боте начислено.", parse_mode=ParseMode.HTML)
                         except Exception:
                             pass
                 else:
@@ -565,14 +564,14 @@ async def increment_referred_play(referred_user: int):
             inviter = rec["inviter"]
             await change_user_virtual(inviter, 3)
             try:
-                await bot.send_message(inviter, "🔥 Вам начислено +3⭐ — приглашённый сыграл 5 раз!")
+                await bot.send_message(inviter, "🔥 Вам начислено +3⭐ на баланс в боте — приглашённый сыграл 5 раз!")
             except Exception:
                 pass
             if GROUP_ID:
                 try:
                     actor = await get_user_display_short(inviter)
                     mention = await get_user_mention_link(referred_user)
-                    await bot.send_message(GROUP_ID, f"{actor}: приглашённый {mention} сыграл пять игр и был засчитан. +3⭐ начислено.", parse_mode=ParseMode.HTML)
+                    await bot.send_message(GROUP_ID, f"{actor}: приглашённый {mention} сыграл пять игр и был засчитан. +3⭐ на баланс в боте начислено.", parse_mode=ParseMode.HTML)
                 except Exception:
                     pass
 
@@ -866,15 +865,30 @@ async def play_callback(call: types.CallbackQuery):
         free_next = await get_user_free_next(user_id)
         if now < free_next:
             rem = free_next - now
-            mins = rem // 60
-            secs = rem % 60
-            min_word = "минут" if mins != 1 else "минуту"
-            sec_word = "секунд" if secs != 1 else "секунду"
+            # show hours and minutes instead of minutes and seconds
+            hrs = rem // 3600
+            mins = (rem % 3600) // 60
+
+            # Russian word forms (simple)
+            if hrs == 1:
+                hr_word = "час"
+            elif 2 <= hrs <= 4:
+                hr_word = "часа"
+            else:
+                hr_word = "часов"
+
+            if mins == 1:
+                min_word = "минуту"
+            elif 2 <= mins <= 4:
+                min_word = "минуты"
+            else:
+                min_word = "минут"
+
             try:
-                await call.answer(f"🏀 Вы сможете повторно сделать бесплатный бросок через {mins} {min_word} и {secs} {sec_word}", show_alert=True)
+                await call.answer(f"🏀 Вы сможете повторно сделать бесплатный бросок через {hrs} {hr_word} и {mins} {min_word}", show_alert=True)
             except Exception:
                 try:
-                    await bot.send_message(user_id, f"🏀 Вы сможете повторно сделать бесплатный бросок через {mins} {min_word} и {secs} {sec_word}")
+                    await bot.send_message(user_id, f"🏀 Вы сможете повторно сделать бесплатный бросок через {hrs} {hr_word} и {mins} {min_word}")
                     await call.answer()
                 except Exception:
                     await call.answer("Подождите.", show_alert=False)
